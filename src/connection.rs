@@ -1,157 +1,129 @@
-use crate::resp_read::{RespError, RespEventsTransformer, RespEventsVisitor};
+use crate::resp_read::{RespError, RespEventsTransformer, RespEventsVisitor, VisitorResult};
 use bytes::{Bytes, BytesMut};
-use std::{fmt::Write, sync::mpsc};
+use std::fmt::{self, Write};
 use tokio::io::AsyncReadExt;
+use tokio::sync::mpsc;
 use tokio::{io::AsyncWriteExt, net::TcpStream};
 
 #[derive(Debug)]
 pub enum ConnectionError {
-    Resp(RespError),
+    Resp(RespError<ProcessorError>),
     Io(std::io::Error),
 }
 
 type Result<T> = std::result::Result<T, ConnectionError>;
 
-pub struct Connection {
-    socket: TcpStream,
-}
+pub async fn handle_connection(mut socket: TcpStream) -> Result<()> {
+    let mut transformer = RespEventsTransformer::new();
+    let mut buf = BytesMut::with_capacity(65536);
+    let mut state = ();
 
-impl Connection {
-    pub fn new(socket: TcpStream) -> Self {
-        Self { socket }
-    }
-
-    pub async fn run(&mut self) -> Result<()> {
-        let mut transformer = RespEventsTransformer::new();
-        let mut buf = BytesMut::with_capacity(65536);
-
-        let (mut sender, receiver) = mpsc::channel::<SendEvents>();
-
-        loop {
-
-            if self
-                .socket
-                .read_buf(&mut buf)
-                .await
-                .map_err(|err| ConnectionError::Io(err))?
-                == 0
-            {
-                break;
-            }
-
-            println!("<< {:?}", &buf);
-            
-
-            let spawn_result = tokio::task::spawn_blocking(
-                move || -> Result<(RespEventsTransformer, BytesMut, mpsc::Sender<SendEvents>)> {
-                    let mut processor = Processor {
-                        sender: &sender,
-                        state: (),
-                    };
-                    transformer
-                        .process(&mut processor, &mut buf)
-                        .map_err(|err| ConnectionError::Resp(err))?;
-
-                    Ok((transformer, buf, sender))
-                },
-            )
+    loop {
+        if socket
+            .read_buf(&mut buf)
             .await
-            .unwrap()?;
+            .map_err(|err| ConnectionError::Io(err))?
+            == 0
+        {
+            break;
+        }
 
-            transformer = spawn_result.0;
-            buf = spawn_result.1;
-            sender = spawn_result.2;
+        println!("<< {:?}", &buf);
 
-            buf.clear();
+        let (sender, mut receiver) = mpsc::channel::<SendEvents>(100);
+        let process_task = tokio::task::spawn_blocking(
+            move || -> Result<(RespEventsTransformer, BytesMut, ())> {
+                let mut processor = Processor { sender, state };
+                transformer
+                    .process(&mut processor, &mut buf)
+                    .map_err(|err| ConnectionError::Resp(err))?;
 
-            loop {
-                let event = receiver.try_recv();
+                Ok((transformer, buf, state))
+            },
+        );
+
+        let sending_task: tokio::task::JoinHandle<Result<TcpStream>> = tokio::spawn(async move {
+            while let Some(event) = receiver.recv().await {
                 match event {
-                    Ok(SendEvents::Data(mut data)) => {
+                    SendEvents::Data(mut data) => {
                         println!(">> {:?}", &data);
-                        self.socket
+                        socket
                             .write_buf(&mut data)
                             .await
                             .map_err(ConnectionError::Io)?;
                     }
-                    Ok(SendEvents::Flush) => {
+                    SendEvents::Flush => {
                         println!(">> flush");
-                        self.socket.flush().await.map_err(ConnectionError::Io)?;
+                        socket.flush().await.map_err(ConnectionError::Io)?;
                     }
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => unreachable!(),
                 }
             }
 
-        }
+            Ok(socket)
+        });
 
-        Ok(())
+        let (process_result, sending_result) = tokio::join!(process_task, sending_task);
+
+        // write back transformer, buf, state
+        let process_result = process_result.unwrap()?;
+        transformer = process_result.0;
+        buf = process_result.1;
+        state = process_result.2;
+
+        // write back socket
+        let sending_result = sending_result.unwrap()?;
+        socket = sending_result;
+
+        buf.clear();
+    }
+
+    Ok(())
+}
+
+pub enum ProcessorError {}
+
+impl fmt::Debug for ProcessorError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "processor error")
     }
 }
 
-struct Processor<'a> {
-    sender: &'a mpsc::Sender<SendEvents>,
+struct Processor {
+    sender: mpsc::Sender<SendEvents>,
     state: (),
 }
 
-impl<'a> RespEventsVisitor for Processor<'a> {
-    fn on_string(&mut self, string: Vec<u8>) {}
-
-    fn on_error(&mut self, error: Vec<u8>) {}
-
-    fn on_integer(&mut self, integer: isize) {}
-
-    fn on_bulk_string(&mut self, bulk_string: Option<Vec<u8>>) {
-        let mut buf = BytesMut::with_capacity(65536);
-        write!(buf, "$2\r\nhi\r\n").unwrap();
-        self.sender.send(SendEvents::Data(buf.into())).unwrap();
+impl RespEventsVisitor<ProcessorError> for Processor {
+    fn on_string(&mut self, _string: Vec<u8>) -> VisitorResult<ProcessorError> {
+        Ok(())
     }
 
-    fn on_array(&mut self, length: Option<usize>) {}
+    fn on_error(&mut self, _error: Vec<u8>) -> VisitorResult<ProcessorError> {
+        Ok(())
+    }
+
+    fn on_integer(&mut self, _integer: isize) -> VisitorResult<ProcessorError> {
+        Ok(())
+    }
+
+    fn on_bulk_string(&mut self, _bulk_string: Option<Vec<u8>>) -> VisitorResult<ProcessorError> {
+        let mut buf = BytesMut::with_capacity(65536);
+        write!(buf, "$2\r\nhi\r\n").unwrap();
+
+        let sender = self.sender.clone();
+        tokio::spawn(async move {
+            let _ = sender.send(SendEvents::Data(buf.into())).await;
+        });
+
+        Ok(())
+    }
+
+    fn on_array(&mut self, _length: Option<usize>) -> VisitorResult<ProcessorError> {
+        Ok(())
+    }
 }
 
 enum SendEvents {
     Data(Bytes),
     Flush,
-}
-
-struct RespEventPrinter {}
-
-impl RespEventsVisitor for RespEventPrinter {
-    fn on_string(&mut self, string: Vec<u8>) {
-        let string = String::from_utf8(string).unwrap();
-        println!("on_string: {}", &string);
-    }
-
-    fn on_error(&mut self, error: Vec<u8>) {
-        let error = String::from_utf8(error).unwrap();
-        println!("on_error: {}", &error);
-    }
-
-    fn on_integer(&mut self, integer: isize) {
-        println!("on_integer: {}", &integer);
-    }
-
-    fn on_bulk_string(&mut self, bulk_string: Option<Vec<u8>>) {
-        match bulk_string {
-            Some(string) => {
-                let string = String::from_utf8(string).unwrap();
-                println!("on_bulk_string: {}", &string);
-            }
-            None => {
-                println!("on_bulk_string: null");
-            }
-        }
-    }
-
-    fn on_array(&mut self, length: Option<usize>) {
-        match length {
-            Some(length) => {
-                println!("on_array: {}", length);
-            }
-            None => {
-                println!("on_array: null");
-            }
-        }
-    }
 }

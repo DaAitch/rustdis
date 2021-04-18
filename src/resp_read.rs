@@ -1,7 +1,6 @@
 use std::{error, fmt};
 
 use bytes::{Buf, BytesMut};
-use futures::Stream;
 
 const B_CR: u8 = b'\r';
 const B_LF: u8 = b'\n';
@@ -18,12 +17,12 @@ const NO_STATE: NoState = NoState {};
 
 macro_rules! impl_step {
     ($name:ident, $state_type:ty, $expected:expr, $state:expr, $next:expr) => {
-        fn $name<T: RespEventsVisitor>(
+        fn $name<VE, T: RespEventsVisitor<VE>>(
             &mut self,
             state: $state_type,
             visitor: &mut T,
             buf: &mut BytesMut,
-        ) -> Result<()> {
+        ) -> Result<(), VE> {
             if buf.remaining() > 0 {
                 let ch = buf.get_u8();
                 if ch == $expected {
@@ -61,11 +60,11 @@ impl RespEventsTransformer {
         }
     }
 
-    pub fn process<T: RespEventsVisitor>(
+    pub fn process<VE, T: RespEventsVisitor<VE>>(
         &mut self,
         visitor: &mut T,
         buf: &mut BytesMut,
-    ) -> Result<()> {
+    ) -> Result<(), VE> {
         entry![self.state.take(), self, visitor, buf,
             Start => buf_process_start,
             String => buf_process_string,
@@ -89,12 +88,12 @@ impl RespEventsTransformer {
         ]
     }
 
-    fn buf_process_start<T: RespEventsVisitor>(
+    fn buf_process_start<VE, T: RespEventsVisitor<VE>>(
         &mut self,
         _: NoState,
         visitor: &mut T,
         buf: &mut BytesMut,
-    ) -> Result<()> {
+    ) -> Result<(), VE> {
         if buf.remaining() > 0 {
             match buf.get_u8() {
                 B_PLUS => self.buf_process_string(StringState { string: vec![] }, visitor, buf),
@@ -123,18 +122,20 @@ impl RespEventsTransformer {
         }
     }
 
-    fn buf_process_string<T: RespEventsVisitor>(
+    fn buf_process_string<VE, T: RespEventsVisitor<VE>>(
         &mut self,
         mut st: StringState,
         visitor: &mut T,
         buf: &mut BytesMut,
-    ) -> Result<()> {
+    ) -> Result<(), VE> {
         match buf.as_ref().iter().enumerate().find(find_cr) {
             Some((index, _)) => {
                 st.string.extend(&buf[..index]);
                 buf.advance(index + 1);
 
-                visitor.on_string(st.string);
+                visitor
+                    .on_string(st.string)
+                    .map_err(RespError::VisitorError)?;
 
                 self.buf_process_string_lf(NO_STATE, visitor, buf)
             }
@@ -146,12 +147,12 @@ impl RespEventsTransformer {
         }
     }
 
-    fn buf_process_string_lf<T: RespEventsVisitor>(
+    fn buf_process_string_lf<VE, T: RespEventsVisitor<VE>>(
         &mut self,
         _: NoState,
         visitor: &mut T,
         buf: &mut BytesMut,
-    ) -> Result<()> {
+    ) -> Result<(), VE> {
         if buf.remaining() > 0 {
             let lf = buf.get_u8();
             if lf == B_LF {
@@ -165,18 +166,20 @@ impl RespEventsTransformer {
         }
     }
 
-    fn buf_process_error<T: RespEventsVisitor>(
+    fn buf_process_error<VE, T: RespEventsVisitor<VE>>(
         &mut self,
         mut st: ErrorState,
         visitor: &mut T,
         buf: &mut BytesMut,
-    ) -> Result<()> {
+    ) -> Result<(), VE> {
         match buf.as_ref().iter().enumerate().find(find_cr) {
             Some((index, _)) => {
                 st.error.extend(&buf[..index]);
                 buf.advance(index + 1);
 
-                visitor.on_error(st.error);
+                visitor
+                    .on_error(st.error)
+                    .map_err(RespError::VisitorError)?;
 
                 self.buf_process_string_lf(NO_STATE, visitor, buf)
             }
@@ -188,12 +191,12 @@ impl RespEventsTransformer {
         }
     }
 
-    fn buf_process_error_lf<T: RespEventsVisitor>(
+    fn buf_process_error_lf<VE, T: RespEventsVisitor<VE>>(
         &mut self,
         _: NoState,
         visitor: &mut T,
         buf: &mut BytesMut,
-    ) -> Result<()> {
+    ) -> Result<(), VE> {
         if buf.remaining() > 0 {
             let lf = buf.get_u8();
             if lf == B_LF {
@@ -207,12 +210,12 @@ impl RespEventsTransformer {
         }
     }
 
-    fn buf_process_integer<T: RespEventsVisitor>(
+    fn buf_process_integer<VE, T: RespEventsVisitor<VE>>(
         &mut self,
         mut st: IntegerState,
         visitor: &mut T,
         buf: &mut BytesMut,
-    ) -> Result<()> {
+    ) -> Result<(), VE> {
         while buf.remaining() > 0 {
             // TODO: check integer overflow e.g.: `:999...999`
             match (buf.get_u8(), st.integer.as_mut()) {
@@ -232,7 +235,9 @@ impl RespEventsTransformer {
                         *integer as isize
                     };
 
-                    visitor.on_integer(integer);
+                    visitor
+                        .on_integer(integer)
+                        .map_err(RespError::VisitorError)?;
                     return self.buf_process_integer_lf(NO_STATE, visitor, buf);
                 }
                 (unexpected_ch, _) => {
@@ -245,12 +250,12 @@ impl RespEventsTransformer {
         Ok(())
     }
 
-    fn buf_process_integer_lf<T: RespEventsVisitor>(
+    fn buf_process_integer_lf<VE, T: RespEventsVisitor<VE>>(
         &mut self,
         _: NoState,
         visitor: &mut T,
         buf: &mut BytesMut,
-    ) -> Result<()> {
+    ) -> Result<(), VE> {
         if buf.remaining() > 0 {
             let lf = buf.get_u8();
             if lf == B_LF {
@@ -264,12 +269,12 @@ impl RespEventsTransformer {
         }
     }
 
-    fn buf_process_bulk_string_len<T: RespEventsVisitor>(
+    fn buf_process_bulk_string_len<VE, T: RespEventsVisitor<VE>>(
         &mut self,
         mut st: BulkStringLenState,
         visitor: &mut T,
         buf: &mut BytesMut,
-    ) -> Result<()> {
+    ) -> Result<(), VE> {
         while buf.remaining() > 0 {
             let ch = buf.get_u8();
             match (ch, st.length.as_mut()) {
@@ -290,7 +295,9 @@ impl RespEventsTransformer {
                     );
                 }
                 (B_MINUS, None) => {
-                    visitor.on_bulk_string(None);
+                    visitor
+                        .on_bulk_string(None)
+                        .map_err(RespError::VisitorError)?;
                     return self.buf_process_bulk_string_len_nbs_one(NO_STATE, visitor, buf);
                 }
                 (unexpected_ch, _) => {
@@ -335,18 +342,20 @@ impl RespEventsTransformer {
         Self::buf_process_bulk_string_data
     );
 
-    fn buf_process_bulk_string_data<T: RespEventsVisitor>(
+    fn buf_process_bulk_string_data<VE, T: RespEventsVisitor<VE>>(
         &mut self,
         mut st: BulkStringDataState,
         visitor: &mut T,
         buf: &mut BytesMut,
-    ) -> Result<()> {
+    ) -> Result<(), VE> {
         if buf.remaining() >= st.remaining {
             let read = st.remaining;
             st.string.extend(&buf[..read]);
             buf.advance(read);
 
-            visitor.on_bulk_string(Some(st.string));
+            visitor
+                .on_bulk_string(Some(st.string))
+                .map_err(RespError::VisitorError)?;
 
             self.buf_process_bulk_string_data_cr(NO_STATE, visitor, buf)
         } else {
@@ -375,12 +384,12 @@ impl RespEventsTransformer {
         Self::buf_process_start
     );
 
-    fn buf_process_array_len<T: RespEventsVisitor>(
+    fn buf_process_array_len<VE, T: RespEventsVisitor<VE>>(
         &mut self,
         mut st: ArrayLenState,
         visitor: &mut T,
         buf: &mut BytesMut,
-    ) -> Result<()> {
+    ) -> Result<(), VE> {
         while buf.remaining() > 0 {
             let ch = buf.get_u8();
             match (ch, st.length.as_mut()) {
@@ -391,12 +400,14 @@ impl RespEventsTransformer {
                     st.length = Some(digit_to_usize_unchecked(str_digit))
                 }
                 (B_CR, Some(length)) => {
-                    visitor.on_array(Some(*length));
+                    visitor
+                        .on_array(Some(*length))
+                        .map_err(RespError::VisitorError)?;
 
                     return self.buf_process_array_len_lf(NoState {}, visitor, buf);
                 }
                 (B_MINUS, None) => {
-                    visitor.on_array(None);
+                    visitor.on_array(None).map_err(RespError::VisitorError)?;
                     return self.buf_process_array_len_na_one(NO_STATE, visitor, buf);
                 }
                 (unexpected_ch, _) => {
@@ -511,18 +522,19 @@ enum State {
     ArrayLenLf(NoState),
 }
 
-type Result<T> = std::result::Result<T, RespError>;
+type Result<T, VE> = std::result::Result<T, RespError<VE>>;
 
-pub enum RespError {
+pub enum RespError<VE> {
     UnrecoverableErrorState,
     ReadingTypeError(u8),
     ExpectedLf(u8),
     UnexpectedChar(u8),
+    VisitorError(VE),
 }
 
-impl error::Error for RespError {}
+impl<VE: error::Error> error::Error for RespError<VE> {}
 
-impl fmt::Debug for RespError {
+impl<VE: fmt::Debug> fmt::Debug for RespError<VE> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             RespError::UnrecoverableErrorState => {
@@ -537,22 +549,27 @@ impl fmt::Debug for RespError {
             RespError::UnexpectedChar(ch) => {
                 writeln!(f, "UnexpectedChar found u8 '{}'", *ch as char)
             }
+            RespError::VisitorError(err) => {
+                writeln!(f, "Visitor error: {:?}", err)
+            }
         }
     }
 }
 
-impl fmt::Display for RespError {
+impl<VE: fmt::Debug> fmt::Display for RespError<VE> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&self, f)
     }
 }
 
-pub trait RespEventsVisitor {
-    fn on_string(&mut self, string: Vec<u8>);
-    fn on_error(&mut self, error: Vec<u8>);
-    fn on_integer(&mut self, integer: isize);
-    fn on_bulk_string(&mut self, bulk_string: Option<Vec<u8>>);
-    fn on_array(&mut self, length: Option<usize>);
+pub type VisitorResult<E> = std::result::Result<(), E>;
+
+pub trait RespEventsVisitor<E = ()> {
+    fn on_string(&mut self, string: Vec<u8>) -> VisitorResult<E>;
+    fn on_error(&mut self, error: Vec<u8>) -> VisitorResult<E>;
+    fn on_integer(&mut self, integer: isize) -> VisitorResult<E>;
+    fn on_bulk_string(&mut self, bulk_string: Option<Vec<u8>>) -> VisitorResult<E>;
+    fn on_array(&mut self, length: Option<usize>) -> VisitorResult<E>;
 }
 
 #[cfg(test)]
@@ -631,24 +648,29 @@ mod tests {
     }
 
     impl RespEventsVisitor for EventCollector {
-        fn on_string(&mut self, string: Vec<u8>) {
+        fn on_string(&mut self, string: Vec<u8>) -> VisitorResult<()> {
             self.strings.push(string);
+            Ok(())
         }
 
-        fn on_integer(&mut self, integer: isize) {
+        fn on_integer(&mut self, integer: isize) -> VisitorResult<()> {
             self.integers.push(integer);
+            Ok(())
         }
 
-        fn on_error(&mut self, error: Vec<u8>) {
+        fn on_error(&mut self, error: Vec<u8>) -> VisitorResult<()> {
             self.errors.push(error);
+            Ok(())
         }
 
-        fn on_bulk_string(&mut self, bulk_string: Option<Vec<u8>>) {
+        fn on_bulk_string(&mut self, bulk_string: Option<Vec<u8>>) -> VisitorResult<()> {
             self.bulk_strings.push(bulk_string);
+            Ok(())
         }
 
-        fn on_array(&mut self, length: Option<usize>) {
+        fn on_array(&mut self, length: Option<usize>) -> VisitorResult<()> {
             self.arrays.push(length);
+            Ok(())
         }
     }
 }

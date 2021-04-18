@@ -1,9 +1,8 @@
-use connection::Connection;
+use connection::handle_connection;
 use tokio::net::TcpListener;
 
 mod connection;
 mod resp_read;
-mod resp_write;
 
 type Error = Box<dyn std::error::Error>;
 
@@ -14,8 +13,7 @@ async fn main() -> Result<(), Error> {
     loop {
         let (socket, _) = listener.accept().await?;
         tokio::spawn(async move {
-            let mut conn = Connection::new(socket);
-            conn.run().await.unwrap();
+            handle_connection(socket).await.unwrap();
         });
     }
 }
