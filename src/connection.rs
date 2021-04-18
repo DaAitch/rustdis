@@ -1,7 +1,7 @@
 use crate::resp_read::{RespError, RespEventsTransformer, RespEventsVisitor};
 use bytes::{Bytes, BytesMut};
 use std::{fmt::Write, sync::mpsc};
-use tokio::{io::AsyncReadExt, task::JoinError};
+use tokio::io::AsyncReadExt;
 use tokio::{io::AsyncWriteExt, net::TcpStream};
 
 #[derive(Debug)]
@@ -22,15 +22,12 @@ impl Connection {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        let transformer = RespEventsTransformer::new();
-        let buf = BytesMut::with_capacity(65536);
+        let mut transformer = RespEventsTransformer::new();
+        let mut buf = BytesMut::with_capacity(65536);
 
-        let (sender, receiver) = mpsc::channel::<SendEvents>();
-
-        let mut context = Some((transformer, buf, sender));
+        let (mut sender, receiver) = mpsc::channel::<SendEvents>();
 
         loop {
-            let (mut transformer, mut buf, sender) = context.take().unwrap();
 
             if self
                 .socket
@@ -43,8 +40,9 @@ impl Connection {
             }
 
             println!("<< {:?}", &buf);
+            
 
-            let (transformer, mut buf, sender) = tokio::task::spawn_blocking(
+            let spawn_result = tokio::task::spawn_blocking(
                 move || -> Result<(RespEventsTransformer, BytesMut, mpsc::Sender<SendEvents>)> {
                     let mut processor = Processor {
                         sender: &sender,
@@ -59,6 +57,10 @@ impl Connection {
             )
             .await
             .unwrap()?;
+
+            transformer = spawn_result.0;
+            buf = spawn_result.1;
+            sender = spawn_result.2;
 
             buf.clear();
 
@@ -81,7 +83,6 @@ impl Connection {
                 }
             }
 
-            context = Some((transformer, buf, sender));
         }
 
         Ok(())
