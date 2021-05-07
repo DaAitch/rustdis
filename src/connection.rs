@@ -5,13 +5,14 @@ use crate::{
 };
 use bytes::{Bytes, BytesMut};
 use log::{debug, trace};
+use tokio::sync::mpsc;
 use tokio::{
     io::AsyncReadExt,
     spawn,
     sync::mpsc::{Receiver, Sender},
+    task::block_in_place,
 };
 use tokio::{io::AsyncWriteExt, net::TcpStream};
-use tokio::{sync::mpsc, task::spawn_blocking};
 
 #[derive(Debug)]
 pub enum ConnectionError {
@@ -24,11 +25,11 @@ pub enum ConnectionError {
 type Result<T> = std::result::Result<T, ConnectionError>;
 
 pub async fn handle_connection(socket: TcpStream, shared_state: SharedState) -> Result<()> {
-    let (sender, receiver) = mpsc::channel::<SendEvents>(10000); // which number makes sense?
+    let (sender, receiver) = mpsc::channel::<SendEvents>(1000); // which number makes sense?
 
     let mut process_ctx = ProcessContext {
         transformer: RespEventsTransformer::new(),
-        buf: BytesMut::with_capacity(65536), // which number makes sense?
+        buf: BytesMut::with_capacity(65530), // which number makes sense?
         state: ProcessorState::NoState,
         sender,
         shared_state,
@@ -43,34 +44,6 @@ pub async fn handle_connection(socket: TcpStream, shared_state: SharedState) -> 
         > 0
     {
         debug!(">> IN  {:?}", &process_ctx.buf);
-
-        let process_task = spawn_blocking(move || {
-            let ProcessContext {
-                mut transformer,
-                mut buf,
-                state,
-                sender,
-                shared_state,
-            } = process_ctx;
-            let mut processor = Processor::new(&sender, &shared_state, state);
-            transformer
-                .process(&mut processor, &mut buf)
-                .map_err(|err| ConnectionError::Resp(err))?;
-
-            let state = processor.into_state();
-
-            Ok(spawn(async move {
-                sender.send(SendEvents::End).await?;
-
-                Ok(ProcessContext {
-                    transformer,
-                    buf,
-                    state,
-                    sender,
-                    shared_state,
-                })
-            }))
-        });
 
         let upstream_task = spawn(async move {
             while let Some(event) = io_ctx.receiver.recv().await {
@@ -94,21 +67,37 @@ pub async fn handle_connection(socket: TcpStream, shared_state: SharedState) -> 
             Ok(io_ctx)
         });
 
-        let (process_result, sending_result) = tokio::join!(process_task, upstream_task);
+        process_ctx = block_in_place(move || {
+            debug!(target: "profiling", "start processing task");
+            let ProcessContext {
+                mut transformer,
+                mut buf,
+                state,
+                sender,
+                shared_state,
+            } = process_ctx;
 
-        {
-            let processor_result = process_result.map_err(ConnectionError::JoinError)?;
-            let end_sender_result = processor_result?;
-            let send_result = end_sender_result
-                .await
-                .map_err(ConnectionError::JoinError)?;
-            process_ctx = send_result.map_err(ConnectionError::SendError)?;
-        }
+            let mut processor = Processor::new(&sender, &shared_state, state);
+            transformer
+                .process(&mut processor, &mut buf)
+                .map_err(ConnectionError::Resp)?;
 
-        {
-            let socket_result = sending_result.map_err(ConnectionError::JoinError)?;
-            io_ctx = socket_result?;
-        }
+            sender
+                .blocking_send(SendEvents::End)
+                .map_err(ConnectionError::SendError)?;
+
+            debug!(target: "profiling", "end processing task");
+
+            Ok(ProcessContext {
+                transformer,
+                buf,
+                state: processor.into_state(),
+                sender,
+                shared_state,
+            })
+        })?;
+
+        io_ctx = upstream_task.await.map_err(ConnectionError::JoinError)??;
 
         process_ctx.buf.clear();
     }
