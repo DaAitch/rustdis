@@ -1,3 +1,4 @@
+use log::trace;
 use tokio::{spawn, sync::mpsc};
 
 use crate::{
@@ -32,6 +33,49 @@ pub enum ProcessorState {
     Integer(isize),
     BulkString(Option<Vec<u8>>),
     Array(Option<ArrayData>),
+}
+
+impl std::fmt::Display for ProcessorState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProcessorState::NoState => {
+                write!(f, "no state")
+            }
+            ProcessorState::String(string) => {
+                let string = String::from_utf8(string.clone()).map_err(|_| std::fmt::Error {})?;
+                write!(f, "\"+{}\"", string)
+            }
+            ProcessorState::Integer(integer) => {
+                write!(f, ":{}", integer)
+            }
+            ProcessorState::BulkString(maybe_string) => match maybe_string {
+                Some(string) => {
+                    let string =
+                        String::from_utf8(string.clone()).map_err(|_| std::fmt::Error {})?;
+                    write!(f, "\"${}\"", string)
+                }
+                None => {
+                    write!(f, "nil string")
+                }
+            },
+            ProcessorState::Array(maybe_array) => match maybe_array {
+                Some(array) => {
+                    write!(f, "* (remaining: {}) [", array.remaining)?;
+                    for (i, value) in array.values.iter().enumerate() {
+                        std::fmt::Display::fmt(value, f)?;
+                        if i + 1 < array.values.len() {
+                            write!(f, ", ")?;
+                        }
+                    }
+
+                    write!(f, "]")
+                }
+                None => {
+                    write!(f, "nil array")
+                }
+            },
+        }
+    }
 }
 
 enum Events {
@@ -69,8 +113,10 @@ impl<'a> Processor<'a> {
     // });
 
     fn send_cmd(&mut self, event: SendEvents) {
-        let sender = self.sender.clone();
-        spawn(async move { sender.send(event).await });
+        // let sender = self.sender.clone();
+        // spawn(async move { sender.send(event).await });
+
+        self.sender.blocking_send(event).unwrap();
     }
 
     pub fn into_state(self) -> ProcessorState {
@@ -85,14 +131,15 @@ impl<'a> Processor<'a> {
     }
 
     fn process_frame(&mut self, state: ProcessorState) {
-        println!("processing frame: {:?}", state);
+        trace!("processing frame: {}", &state);
+
         match state {
             ProcessorState::Array(Some(ArrayData { mut values, .. })) => {
                 let mut drain = values.drain(..);
 
                 match (drain.next(), drain.next(), drain.next(), drain.next()) {
                     (Some(ProcessorState::BulkString(Some(cmd))), None, None, None) => {
-                        if cmd == b"info" {
+                        if cmd.eq_ignore_ascii_case(b"info") {
                             self.send_cmd(SendEvents::InfoCommand);
                         }
                     }
@@ -102,7 +149,7 @@ impl<'a> Processor<'a> {
                         None,
                         None,
                     ) => {
-                        if cmd == b"get" {
+                        if cmd.eq_ignore_ascii_case(b"get") {
                             self.send_cmd(SendEvents::GetCommand(p1_str));
                         }
                     }
@@ -112,7 +159,7 @@ impl<'a> Processor<'a> {
                         Some(ProcessorState::BulkString(Some(p2_str))),
                         None,
                     ) => {
-                        if cmd == b"set" {
+                        if cmd.eq_ignore_ascii_case(b"set") {
                             self.send_cmd(SendEvents::SetCommand(p1_str, p2_str));
                         }
                     }

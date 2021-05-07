@@ -1,9 +1,9 @@
+use super::{B_0, B_1, B_9, B_ASTERISK, B_COLLON, B_CR, B_DOLLAR, B_LF, B_MINUS, B_PLUS};
+use bytes::{Buf, BytesMut};
+use log::{debug, trace};
 use std::{error, fmt};
 
-use bytes::{Buf, BytesMut};
-
-use super::{B_0, B_1, B_9, B_ASTERISK, B_COLLON, B_CR, B_DOLLAR, B_LF, B_MINUS, B_PLUS};
-
+const MAX_STACK_DEPTH: u32 = 1000;
 const NO_STATE: NoState = NoState {};
 
 macro_rules! impl_step {
@@ -13,16 +13,24 @@ macro_rules! impl_step {
             state: $state_type,
             visitor: &mut T,
             buf: &mut BytesMut,
+            mut stack_frame: u32,
         ) -> Result<(), VE> {
+            if !increment_stack_frame(&mut stack_frame) {
+                self.state = Some($state(state));
+                return Ok(());
+            }
+
             if buf.remaining() > 0 {
                 let ch = buf.get_u8();
                 if ch == $expected {
-                    $next(self, state, visitor, buf)
+                    $next(self, state, visitor, buf, stack_frame)
                 } else {
                     Err(RespError::UnexpectedChar(ch))
                 }
             } else {
                 self.state = Some($state(state));
+
+                debug_assert!(!buf.has_remaining());
                 Ok(())
             }
         }
@@ -33,7 +41,7 @@ macro_rules! entry {
     ($state:expr, $this:expr, $visitor:expr, $buf:expr, $( $state_enum:ident => $func:ident, )*) => {
         match $state {
             $(
-                Some(State::$state_enum(state)) => Self::$func($this, state, $visitor, $buf),
+                Some(State::$state_enum(state)) => Self::$func($this, state, $visitor, $buf, 1),
             )*
             None => Err(RespError::UnrecoverableErrorState),
         }
@@ -56,27 +64,34 @@ impl RespEventsTransformer {
         visitor: &mut T,
         buf: &mut BytesMut,
     ) -> Result<(), VE> {
-        entry![self.state.take(), self, visitor, buf,
-            Start => buf_process_start,
-            String => buf_process_string,
-            StringLf => buf_process_string_lf,
-            Error => buf_process_error,
-            ErrorLf => buf_process_error_lf,
-            Integer => buf_process_integer,
-            IntegerLf => buf_process_integer_lf,
-            BulkStringLen => buf_process_bulk_string_len,
-            BulkStringLenNbsOne => buf_process_bulk_string_len_nbs_one,
-            BulkStringLenNbsCr => buf_process_bulk_string_len_nbs_cr,
-            BulkStringLenNbsLf => buf_process_bulk_string_len_nbs_lf,
-            BulkStringData => buf_process_bulk_string_data,
-            BulkStringDataCr => buf_process_bulk_string_data_cr,
-            BulkStringDataLf => buf_process_bulk_string_data_lf,
-            ArrayLen => buf_process_array_len,
-            ArrayLenNaOne => buf_process_array_len_na_one,
-            ArrayLenNaCr => buf_process_array_len_na_cr,
-            ArrayLenNaLf => buf_process_array_len_na_lf,
-            ArrayLenLf => buf_process_array_len_lf,
-        ]
+        while buf.has_remaining() {
+            trace!("start process at state: {:?}", &self.state);
+
+            entry![self.state.take(), self, visitor, buf,
+                Start => buf_process_start,
+                String => buf_process_string,
+                StringLf => buf_process_string_lf,
+                Error => buf_process_error,
+                ErrorLf => buf_process_error_lf,
+                Integer => buf_process_integer,
+                IntegerLf => buf_process_integer_lf,
+                BulkStringLen => buf_process_bulk_string_len,
+                BulkStringLenNbsOne => buf_process_bulk_string_len_nbs_one,
+                BulkStringLenNbsCr => buf_process_bulk_string_len_nbs_cr,
+                BulkStringLenNbsLf => buf_process_bulk_string_len_nbs_lf,
+                BulkStringData => buf_process_bulk_string_data,
+                BulkStringLenLf => buf_process_bulk_string_len_lf,
+                BulkStringDataCr => buf_process_bulk_string_data_cr,
+                BulkStringDataLf => buf_process_bulk_string_data_lf,
+                ArrayLen => buf_process_array_len,
+                ArrayLenNaOne => buf_process_array_len_na_one,
+                ArrayLenNaCr => buf_process_array_len_na_cr,
+                ArrayLenNaLf => buf_process_array_len_na_lf,
+                ArrayLenLf => buf_process_array_len_lf,
+            ]?
+        }
+
+        Ok(())
     }
 
     fn buf_process_start<VE, T: RespEventsVisitor<VE>>(
@@ -84,11 +99,24 @@ impl RespEventsTransformer {
         _: NoState,
         visitor: &mut T,
         buf: &mut BytesMut,
+        mut stack_frame: u32,
     ) -> Result<(), VE> {
+        if !increment_stack_frame(&mut stack_frame) {
+            self.state = Some(State::Start(NO_STATE));
+            return Ok(());
+        }
+
         if buf.remaining() > 0 {
             match buf.get_u8() {
-                B_PLUS => self.buf_process_string(StringState { string: vec![] }, visitor, buf),
-                B_MINUS => self.buf_process_error(ErrorState { error: vec![] }, visitor, buf),
+                B_PLUS => self.buf_process_string(
+                    StringState { string: vec![] },
+                    visitor,
+                    buf,
+                    stack_frame,
+                ),
+                B_MINUS => {
+                    self.buf_process_error(ErrorState { error: vec![] }, visitor, buf, stack_frame)
+                }
                 B_COLLON => self.buf_process_integer(
                     IntegerState {
                         integer: None,
@@ -96,19 +124,26 @@ impl RespEventsTransformer {
                     },
                     visitor,
                     buf,
+                    stack_frame,
                 ),
                 B_DOLLAR => self.buf_process_bulk_string_len(
                     BulkStringLenState { length: None },
                     visitor,
                     buf,
+                    stack_frame,
                 ),
-                B_ASTERISK => {
-                    self.buf_process_array_len(ArrayLenState { length: None }, visitor, buf)
-                }
+                B_ASTERISK => self.buf_process_array_len(
+                    ArrayLenState { length: None },
+                    visitor,
+                    buf,
+                    stack_frame,
+                ),
                 unexpected_ch => Err(RespError::ReadingTypeError(unexpected_ch)),
             }
         } else {
             self.state = Some(State::Start(NO_STATE));
+
+            debug_assert!(!buf.has_remaining());
             Ok(())
         }
     }
@@ -118,7 +153,13 @@ impl RespEventsTransformer {
         mut st: StringState,
         visitor: &mut T,
         buf: &mut BytesMut,
+        mut stack_frame: u32,
     ) -> Result<(), VE> {
+        if !increment_stack_frame(&mut stack_frame) {
+            self.state = Some(State::String(st));
+            return Ok(());
+        }
+
         match buf.as_ref().iter().enumerate().find(find_cr) {
             Some((index, _)) => {
                 st.string.extend(&buf[..index]);
@@ -128,11 +169,14 @@ impl RespEventsTransformer {
                     .on_string(st.string)
                     .map_err(RespError::VisitorError)?;
 
-                self.buf_process_string_lf(NO_STATE, visitor, buf)
+                self.buf_process_string_lf(NO_STATE, visitor, buf, stack_frame)
             }
             None => {
                 st.string.extend(buf.iter());
                 self.state = Some(State::String(st));
+
+                buf.clear();
+                debug_assert!(!buf.has_remaining());
                 Ok(())
             }
         }
@@ -143,16 +187,24 @@ impl RespEventsTransformer {
         _: NoState,
         visitor: &mut T,
         buf: &mut BytesMut,
+        mut stack_frame: u32,
     ) -> Result<(), VE> {
+        if !increment_stack_frame(&mut stack_frame) {
+            self.state = Some(State::StringLf(NO_STATE));
+            return Ok(());
+        }
+
         if buf.remaining() > 0 {
             let lf = buf.get_u8();
             if lf == B_LF {
-                self.buf_process_start(NO_STATE, visitor, buf)
+                self.buf_process_start(NO_STATE, visitor, buf, stack_frame)
             } else {
                 Err(RespError::ExpectedLf(lf))
             }
         } else {
             self.state = Some(State::StringLf(NO_STATE));
+
+            debug_assert!(!buf.has_remaining());
             Ok(())
         }
     }
@@ -162,7 +214,13 @@ impl RespEventsTransformer {
         mut st: ErrorState,
         visitor: &mut T,
         buf: &mut BytesMut,
+        mut stack_frame: u32,
     ) -> Result<(), VE> {
+        if !increment_stack_frame(&mut stack_frame) {
+            self.state = Some(State::Error(st));
+            return Ok(());
+        }
+
         match buf.as_ref().iter().enumerate().find(find_cr) {
             Some((index, _)) => {
                 st.error.extend(&buf[..index]);
@@ -172,11 +230,14 @@ impl RespEventsTransformer {
                     .on_error(st.error)
                     .map_err(RespError::VisitorError)?;
 
-                self.buf_process_string_lf(NO_STATE, visitor, buf)
+                self.buf_process_string_lf(NO_STATE, visitor, buf, stack_frame)
             }
             None => {
                 st.error.extend(buf.iter());
                 self.state = Some(State::Error(st));
+                buf.clear();
+
+                debug_assert!(!buf.has_remaining());
                 Ok(())
             }
         }
@@ -187,16 +248,24 @@ impl RespEventsTransformer {
         _: NoState,
         visitor: &mut T,
         buf: &mut BytesMut,
+        mut stack_frame: u32,
     ) -> Result<(), VE> {
+        if !increment_stack_frame(&mut stack_frame) {
+            self.state = Some(State::ErrorLf(NO_STATE));
+            return Ok(());
+        }
+
         if buf.remaining() > 0 {
             let lf = buf.get_u8();
             if lf == B_LF {
-                self.buf_process_start(NO_STATE, visitor, buf)
+                self.buf_process_start(NO_STATE, visitor, buf, stack_frame)
             } else {
                 Err(RespError::ExpectedLf(lf))
             }
         } else {
             self.state = Some(State::ErrorLf(NO_STATE));
+
+            debug_assert!(!buf.has_remaining());
             Ok(())
         }
     }
@@ -206,7 +275,13 @@ impl RespEventsTransformer {
         mut st: IntegerState,
         visitor: &mut T,
         buf: &mut BytesMut,
+        mut stack_frame: u32,
     ) -> Result<(), VE> {
+        if !increment_stack_frame(&mut stack_frame) {
+            self.state = Some(State::Integer(st));
+            return Ok(());
+        }
+
         while buf.remaining() > 0 {
             // TODO: check integer overflow e.g.: `:999...999`
             match (buf.get_u8(), st.integer.as_mut()) {
@@ -229,7 +304,7 @@ impl RespEventsTransformer {
                     visitor
                         .on_integer(integer)
                         .map_err(RespError::VisitorError)?;
-                    return self.buf_process_integer_lf(NO_STATE, visitor, buf);
+                    return self.buf_process_integer_lf(NO_STATE, visitor, buf, stack_frame);
                 }
                 (unexpected_ch, _) => {
                     return Err(RespError::UnexpectedChar(unexpected_ch));
@@ -238,6 +313,8 @@ impl RespEventsTransformer {
         }
 
         self.state = Some(State::Integer(st));
+
+        debug_assert!(!buf.has_remaining());
         Ok(())
     }
 
@@ -246,16 +323,24 @@ impl RespEventsTransformer {
         _: NoState,
         visitor: &mut T,
         buf: &mut BytesMut,
+        mut stack_frame: u32,
     ) -> Result<(), VE> {
+        if !increment_stack_frame(&mut stack_frame) {
+            self.state = Some(State::IntegerLf(NO_STATE));
+            return Ok(());
+        }
+
         if buf.remaining() > 0 {
             let lf = buf.get_u8();
             if lf == B_LF {
-                self.buf_process_start(NO_STATE, visitor, buf)
+                self.buf_process_start(NO_STATE, visitor, buf, stack_frame)
             } else {
                 Err(RespError::ExpectedLf(lf))
             }
         } else {
             self.state = Some(State::IntegerLf(NO_STATE));
+
+            debug_assert!(!buf.has_remaining());
             Ok(())
         }
     }
@@ -265,7 +350,13 @@ impl RespEventsTransformer {
         mut st: BulkStringLenState,
         visitor: &mut T,
         buf: &mut BytesMut,
+        mut stack_frame: u32,
     ) -> Result<(), VE> {
+        if !increment_stack_frame(&mut stack_frame) {
+            self.state = Some(State::BulkStringLen(st));
+            return Ok(());
+        }
+
         while buf.remaining() > 0 {
             let ch = buf.get_u8();
             match (ch, st.length.as_mut()) {
@@ -279,17 +370,23 @@ impl RespEventsTransformer {
                     return self.buf_process_bulk_string_len_lf(
                         BulkStringDataState {
                             remaining: *length,
-                            string: vec![],
+                            string: Vec::with_capacity(*length),
                         },
                         visitor,
                         buf,
+                        stack_frame,
                     );
                 }
                 (B_MINUS, None) => {
                     visitor
                         .on_bulk_string(None)
                         .map_err(RespError::VisitorError)?;
-                    return self.buf_process_bulk_string_len_nbs_one(NO_STATE, visitor, buf);
+                    return self.buf_process_bulk_string_len_nbs_one(
+                        NO_STATE,
+                        visitor,
+                        buf,
+                        stack_frame,
+                    );
                 }
                 (unexpected_ch, _) => {
                     return Err(RespError::UnexpectedChar(unexpected_ch));
@@ -298,6 +395,8 @@ impl RespEventsTransformer {
         }
 
         self.state = Some(State::BulkStringLen(st));
+
+        debug_assert!(!buf.has_remaining());
         Ok(())
     }
 
@@ -329,7 +428,7 @@ impl RespEventsTransformer {
         buf_process_bulk_string_len_lf,
         BulkStringDataState,
         B_LF,
-        State::BulkStringData,
+        State::BulkStringLenLf,
         Self::buf_process_bulk_string_data
     );
 
@@ -338,7 +437,13 @@ impl RespEventsTransformer {
         mut st: BulkStringDataState,
         visitor: &mut T,
         buf: &mut BytesMut,
+        mut stack_frame: u32,
     ) -> Result<(), VE> {
+        if !increment_stack_frame(&mut stack_frame) {
+            self.state = Some(State::BulkStringData(st));
+            return Ok(());
+        }
+
         if buf.remaining() >= st.remaining {
             let read = st.remaining;
             st.string.extend(&buf[..read]);
@@ -348,13 +453,16 @@ impl RespEventsTransformer {
                 .on_bulk_string(Some(st.string))
                 .map_err(RespError::VisitorError)?;
 
-            self.buf_process_bulk_string_data_cr(NO_STATE, visitor, buf)
+            self.buf_process_bulk_string_data_cr(NO_STATE, visitor, buf, stack_frame)
         } else {
-            let read = buf.remaining();
-            st.string.extend(&buf[..read]);
-            buf.advance(read);
+            let remaining = buf.remaining();
+            st.string.extend(&buf[..]);
+            buf.clear();
+            st.remaining -= remaining;
 
             self.state = Some(State::BulkStringData(st));
+
+            debug_assert!(!buf.has_remaining());
             Ok(())
         }
     }
@@ -380,7 +488,13 @@ impl RespEventsTransformer {
         mut st: ArrayLenState,
         visitor: &mut T,
         buf: &mut BytesMut,
+        mut stack_frame: u32,
     ) -> Result<(), VE> {
+        if !increment_stack_frame(&mut stack_frame) {
+            self.state = Some(State::ArrayLen(st));
+            return Ok(());
+        }
+
         while buf.remaining() > 0 {
             let ch = buf.get_u8();
             match (ch, st.length.as_mut()) {
@@ -395,11 +509,11 @@ impl RespEventsTransformer {
                         .on_array(Some(*length))
                         .map_err(RespError::VisitorError)?;
 
-                    return self.buf_process_array_len_lf(NoState {}, visitor, buf);
+                    return self.buf_process_array_len_lf(NoState {}, visitor, buf, stack_frame);
                 }
                 (B_MINUS, None) => {
                     visitor.on_array(None).map_err(RespError::VisitorError)?;
-                    return self.buf_process_array_len_na_one(NO_STATE, visitor, buf);
+                    return self.buf_process_array_len_na_one(NO_STATE, visitor, buf, stack_frame);
                 }
                 (unexpected_ch, _) => {
                     return Err(RespError::UnexpectedChar(unexpected_ch));
@@ -408,6 +522,8 @@ impl RespEventsTransformer {
         }
 
         self.state = Some(State::ArrayLen(st));
+
+        debug_assert!(!buf.has_remaining());
         Ok(())
     }
 
@@ -453,21 +569,51 @@ fn find_cr(item: &(usize, &u8)) -> bool {
     *item.1 == B_CR
 }
 
+fn increment_stack_frame(stack_frame: &mut u32) -> bool {
+    *stack_frame = *stack_frame + 1;
+    let can_continue = *stack_frame < MAX_STACK_DEPTH;
+
+    if !can_continue {
+        debug!("recommending stack unwind {}", MAX_STACK_DEPTH);
+    }
+
+    can_continue
+}
+
+#[derive(Debug)]
 struct NoState {}
 
 struct StringState {
     string: Vec<u8>,
 }
 
+impl std::fmt::Debug for StringState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StringState")
+            .field("string", &String::from_utf8(self.string.clone()).unwrap())
+            .finish()
+    }
+}
+
 struct ErrorState {
     error: Vec<u8>,
 }
 
+impl std::fmt::Debug for ErrorState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ErrorState")
+            .field("error", &String::from_utf8(self.error.clone()).unwrap())
+            .finish()
+    }
+}
+
+#[derive(Debug)]
 struct IntegerState {
     integer: Option<usize>,
     is_negative: bool,
 }
 
+#[derive(Debug)]
 struct BulkStringLenState {
     length: Option<usize>,
 }
@@ -477,10 +623,21 @@ struct BulkStringDataState {
     string: Vec<u8>,
 }
 
+impl std::fmt::Debug for BulkStringDataState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BulkStringDataState")
+            .field("remaining", &self.remaining)
+            .field("string", &String::from_utf8(self.string.clone()).unwrap())
+            .finish()
+    }
+}
+
+#[derive(Debug)]
 struct ArrayLenState {
     length: Option<usize>,
 }
 
+#[derive(Debug)]
 enum State {
     Start(NoState),
 
@@ -498,6 +655,7 @@ enum State {
 
     // bulk string
     BulkStringLen(BulkStringLenState),
+    BulkStringLenLf(BulkStringDataState),
     BulkStringLenNbsOne(NoState),
     BulkStringLenNbsCr(NoState),
     BulkStringLenNbsLf(NoState),
@@ -565,43 +723,54 @@ pub trait RespEventsVisitor<E = ()> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use bytes::BufMut;
     use std::fmt::Write;
 
-    use super::*;
-
     #[test]
-    fn test_types() {
-        let mut collector = EventCollector::new();
-        let mut resp = RespEventsTransformer::new();
+    fn test_simple_without_breaks() {
+        test_scenario(&[
+            "",
+            "+a string\r\n",
+            "+\r\n",
+            "-an error\r\n",
+            "-\r\n",
+            ":123456\r\n",
+            ":-4321\r\n",
+            ":0\r\n",
+            ":-0\r\n",
+            "$21\r\nThis is a bulk string\r\n",
+            "$-1\r\n",
+            "*-1\r\n",
+            "*0\r\n",
+            "*3\r\n",
+        ], "str: a string, str: , err: an error, err: , int: 123456, int: -4321, int: 0, int: 0, bstr: This is a bulk string, bstr: nil, arr: nil, arr: 0, arr: 3, ");
+    }
 
-        resp.process(&mut collector, &mut buf("")).unwrap();
-        resp.process(&mut collector, &mut buf("+a string\r\n"))
-            .unwrap();
-        resp.process(&mut collector, &mut buf("+\r\n")).unwrap();
-        resp.process(&mut collector, &mut buf("-an error\r\n"))
-            .unwrap();
-        resp.process(&mut collector, &mut buf("-\r\n")).unwrap();
-        resp.process(&mut collector, &mut buf(":123456\r\n"))
-            .unwrap();
-        resp.process(&mut collector, &mut buf(":-4321\r\n"))
-            .unwrap();
-        resp.process(&mut collector, &mut buf(":0\r\n")).unwrap();
-        resp.process(&mut collector, &mut buf(":-0\r\n")).unwrap();
-        resp.process(&mut collector, &mut buf("$21\r\nThis is a bulk string\r\n"))
-            .unwrap();
-        resp.process(&mut collector, &mut buf("$-1\r\n")).unwrap();
-        resp.process(&mut collector, &mut buf("*-1\r\n")).unwrap();
-        resp.process(&mut collector, &mut buf("*0\r\n")).unwrap();
-        resp.process(&mut collector, &mut buf("*3\r\n")).unwrap();
+    fn test_scenario(values: &[&str], expected_outcome: &str) {
+        {
+            let mut visitor = EventCollector::new();
+            let mut resp = RespEventsTransformer::new();
 
-        assert_eq!(collector.strings, vec![vec_u8(b"a string"), vec_u8(b"")]);
-        assert_eq!(collector.errors, vec![vec_u8(b"an error"), vec_u8(b"")]);
-        assert_eq!(collector.integers, vec![123456, -4321, 0, 0]);
-        assert_eq!(
-            collector.bulk_strings,
-            vec![Some(vec_u8(b"This is a bulk string")), None]
-        );
-        assert_eq!(collector.arrays, vec![None, Some(0), Some(3)]);
+            for value in values {
+                resp.process(&mut visitor, &mut buf(value)).unwrap();
+            }
+
+            assert_eq!(visitor.out, expected_outcome);
+        }
+
+        {
+            let mut visitor = EventCollector::new();
+            let mut resp = RespEventsTransformer::new();
+
+            for value in values {
+                for byte in value.as_bytes() {
+                    resp.process(&mut visitor, &mut buf_u8(*byte)).unwrap();
+                }
+            }
+
+            assert_eq!(visitor.out, expected_outcome);
+        }
     }
 
     fn buf(string: &str) -> BytesMut {
@@ -611,56 +780,67 @@ mod tests {
         buf
     }
 
-    fn vec_u8(bytes: &[u8]) -> Vec<u8> {
-        let mut v = Vec::<u8>::new();
-        v.extend(bytes.iter());
-        v
+    fn buf_u8(byte: u8) -> BytesMut {
+        let mut buf = BytesMut::new();
+        buf.put_u8(byte);
+
+        buf
     }
 
     #[derive(Debug)]
     struct EventCollector {
-        strings: Vec<Vec<u8>>,
-        integers: Vec<isize>,
-        errors: Vec<Vec<u8>>,
-        bulk_strings: Vec<Option<Vec<u8>>>,
-        arrays: Vec<Option<usize>>,
+        out: BytesMut,
     }
 
     impl EventCollector {
         fn new() -> Self {
             Self {
-                strings: vec![],
-                integers: vec![],
-                errors: vec![],
-                bulk_strings: vec![],
-                arrays: vec![],
+                out: BytesMut::with_capacity(65536),
             }
         }
     }
 
     impl RespEventsVisitor for EventCollector {
         fn on_string(&mut self, string: Vec<u8>) -> VisitorResult<()> {
-            self.strings.push(string);
+            let string = String::from_utf8(string).unwrap();
+            write!(&mut self.out, "str: {}, ", &string).unwrap();
             Ok(())
         }
 
         fn on_integer(&mut self, integer: isize) -> VisitorResult<()> {
-            self.integers.push(integer);
+            write!(&mut self.out, "int: {}, ", integer).unwrap();
             Ok(())
         }
 
         fn on_error(&mut self, error: Vec<u8>) -> VisitorResult<()> {
-            self.errors.push(error);
+            let error = String::from_utf8(error).unwrap();
+            write!(&mut self.out, "err: {}, ", &error).unwrap();
             Ok(())
         }
 
         fn on_bulk_string(&mut self, bulk_string: Option<Vec<u8>>) -> VisitorResult<()> {
-            self.bulk_strings.push(bulk_string);
+            match bulk_string {
+                Some(bulk_string) => {
+                    let bulk_string = String::from_utf8(bulk_string).unwrap();
+                    write!(&mut self.out, "bstr: {}, ", &bulk_string).unwrap();
+                }
+                None => {
+                    write!(&mut self.out, "bstr: nil, ").unwrap();
+                }
+            }
             Ok(())
         }
 
         fn on_array(&mut self, length: Option<usize>) -> VisitorResult<()> {
-            self.arrays.push(length);
+            match length {
+                Some(length) => {
+                    write!(&mut self.out, "arr: {}, ", &length).unwrap();
+                }
+                None => {
+                    write!(&mut self.out, "arr: nil, ").unwrap();
+                }
+            }
+
             Ok(())
         }
     }

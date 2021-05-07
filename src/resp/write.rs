@@ -1,7 +1,8 @@
+use log::{debug, error, log_enabled};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
-use super::{B_ASTERISK, B_CR, B_DOLLAR, B_LF};
+use super::{B_ASTERISK, B_DOLLAR};
 
 type Result<T> = std::io::Result<T>;
 
@@ -15,7 +16,6 @@ impl<'a> SocketWriter<'a> {
     }
 
     async fn write(&mut self, bytes: &[u8]) -> Result<()> {
-        println!("<< OUT {:?}", String::from_utf8(bytes.into()).unwrap());
         self.socket.write_all(bytes).await
     }
 
@@ -25,6 +25,17 @@ impl<'a> SocketWriter<'a> {
     }
 
     pub async fn write_bulk_string(&mut self, bytes: &[u8]) -> Result<()> {
+        if log_enabled!(log::Level::Debug) {
+            match String::from_utf8(Vec::from(bytes)) {
+                Ok(string) => {
+                    debug!("<< $ {}", string);
+                }
+                Err(e) => {
+                    error!("write bulk string error: {}", e);
+                }
+            }
+        }
+
         self.write(&[B_DOLLAR]).await?;
         let len = bytes.len().to_string();
         self.write(len.as_bytes()).await?;
@@ -36,6 +47,7 @@ impl<'a> SocketWriter<'a> {
     }
 
     pub async fn write_bulk_string_nil(&mut self) -> Result<()> {
+        debug!("<< $ nil");
         self.write(b"$-1\r\n").await?;
         Ok(())
     }
@@ -45,13 +57,19 @@ impl<'a> SocketWriter<'a> {
     }
 
     pub async fn write_array_start(&mut self, len: &[u8]) -> Result<()> {
+        if log_enabled!(log::Level::Debug) {
+            match String::from_utf8(Vec::from(len)) {
+                Ok(string) => {
+                    debug!("<< * {}", string);
+                }
+                Err(e) => {
+                    error!("write array error: {}", e);
+                }
+            }
+        }
+
         self.write(&[B_ASTERISK]).await?;
         self.write(len).await?;
-        self.write_rn().await?;
-        Ok(())
-    }
-
-    pub async fn write_array_end(&mut self) -> Result<()> {
         self.write_rn().await?;
         Ok(())
     }

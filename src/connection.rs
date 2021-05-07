@@ -1,21 +1,22 @@
 use std::collections::HashMap;
 
-use crate::resp::read::{RespError, RespEventsTransformer};
 use crate::{
     processor::{Processor, ProcessorError, ProcessorState},
     resp::write::SocketWriter,
 };
-use bytes::{Buf, Bytes, BytesMut};
+use crate::{
+    resp::read::{RespError, RespEventsTransformer},
+    SharedState,
+};
+use bytes::BytesMut;
+use log::{debug, trace};
+use tokio::net::TcpStream;
 use tokio::{
     io::AsyncReadExt,
     spawn,
     sync::mpsc::{Receiver, Sender},
 };
-use tokio::{io::AsyncWriteExt, net::TcpStream};
-use tokio::{
-    sync::mpsc::{self, error::SendError},
-    task::{spawn_blocking, JoinHandle},
-};
+use tokio::{sync::mpsc, task::spawn_blocking};
 
 #[derive(Debug)]
 pub enum ConnectionError {
@@ -27,8 +28,8 @@ pub enum ConnectionError {
 
 type Result<T> = std::result::Result<T, ConnectionError>;
 
-pub async fn handle_connection(socket: TcpStream) -> Result<()> {
-    let (sender, receiver) = mpsc::channel::<SendEvents>(100);
+pub async fn handle_connection(socket: TcpStream, shared_state: SharedState) -> Result<()> {
+    let (sender, receiver) = mpsc::channel::<SendEvents>(10000);
 
     let mut process_ctx = ProcessContext {
         transformer: RespEventsTransformer::new(),
@@ -39,7 +40,7 @@ pub async fn handle_connection(socket: TcpStream) -> Result<()> {
     let mut io_ctx = UpstreamContext {
         socket,
         receiver,
-        values: HashMap::new(),
+        shared_state,
     };
 
     while io_ctx
@@ -49,7 +50,7 @@ pub async fn handle_connection(socket: TcpStream) -> Result<()> {
         .map_err(|err| ConnectionError::Io(err))?
         > 0
     {
-        println!(">> IN  {:?}", &process_ctx.buf);
+        debug!(">> IN  {:?}", &process_ctx.buf);
 
         let process_task = spawn_blocking(move || {
             let ProcessContext {
@@ -81,7 +82,8 @@ pub async fn handle_connection(socket: TcpStream) -> Result<()> {
             let mut socket_writer = SocketWriter::new(&mut io_ctx.socket);
 
             while let Some(event) = io_ctx.receiver.recv().await {
-                println!("event: {:?}", &event);
+                trace!("upstream event: {}", &event);
+
                 match event {
                     SendEvents::InfoCommand => {
                         socket_writer
@@ -90,15 +92,21 @@ pub async fn handle_connection(socket: TcpStream) -> Result<()> {
                             .map_err(ConnectionError::Io)?;
                     }
                     SendEvents::SetCommand(key, value) => {
-                        io_ctx.values.insert(key, value);
+                        let _ = io_ctx.shared_state.write().unwrap().insert(key, value);
                         socket_writer
                             .write_ok()
                             .await
                             .map_err(ConnectionError::Io)?;
                     }
                     SendEvents::GetCommand(key) => {
-                        let maybe_value = io_ctx.values.get(&key);
-                        match maybe_value {
+                        let state = io_ctx
+                            .shared_state
+                            .read()
+                            .unwrap()
+                            .get(&key)
+                            .map(|value| value.clone());
+
+                        match state {
                             Some(value) => {
                                 socket_writer
                                     .write_bulk_string(value.as_slice())
@@ -146,13 +154,34 @@ pub async fn handle_connection(socket: TcpStream) -> Result<()> {
 
 #[derive(Debug)]
 pub enum SendEvents {
-    // Command(Command),
-    // Data(Bytes),
-    // Flush,
     SetCommand(Vec<u8>, Vec<u8>),
     GetCommand(Vec<u8>),
     InfoCommand,
     End,
+}
+
+impl std::fmt::Display for SendEvents {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SendEvents::InfoCommand => {
+                write!(f, "info")
+            }
+            SendEvents::SetCommand(key, value) => {
+                let key = String::from_utf8(key.clone()).map_err(|_| std::fmt::Error {})?;
+                let value = String::from_utf8(value.clone()).map_err(|_| std::fmt::Error {})?;
+
+                write!(f, "set {} {}", &key, &value)
+            }
+            SendEvents::GetCommand(key) => {
+                let key = String::from_utf8(key.clone()).map_err(|_| std::fmt::Error {})?;
+
+                write!(f, "get {}", &key)
+            }
+            SendEvents::End => {
+                write!(f, "END")
+            }
+        }
+    }
 }
 
 struct ProcessContext {
@@ -165,5 +194,5 @@ struct ProcessContext {
 struct UpstreamContext {
     socket: TcpStream,
     receiver: Receiver<SendEvents>,
-    values: HashMap<Vec<u8>, Vec<u8>>,
+    shared_state: SharedState,
 }
