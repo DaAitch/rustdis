@@ -1,5 +1,5 @@
 use log::trace;
-use tokio::{spawn, sync::mpsc};
+use tokio::sync::mpsc;
 
 use crate::{
     connection::SendEvents,

@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use crate::{
     processor::{Processor, ProcessorError, ProcessorState},
     resp::write::SocketWriter,
@@ -29,11 +27,11 @@ pub enum ConnectionError {
 type Result<T> = std::result::Result<T, ConnectionError>;
 
 pub async fn handle_connection(socket: TcpStream, shared_state: SharedState) -> Result<()> {
-    let (sender, receiver) = mpsc::channel::<SendEvents>(10000);
+    let (sender, receiver) = mpsc::channel::<SendEvents>(10000); // which number makes sense?
 
     let mut process_ctx = ProcessContext {
         transformer: RespEventsTransformer::new(),
-        buf: BytesMut::with_capacity(65536),
+        buf: BytesMut::with_capacity(65536), // which number makes sense?
         state: ProcessorState::NoState,
         sender,
     };
