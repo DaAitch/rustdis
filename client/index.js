@@ -5,5 +5,7 @@ client.on("error", function(error) {
   console.error(error);
 });
 
-client.set("key", "value", redis.print);
-client.get("key", redis.print);
+for (let i = 0; i < 100; i++) {
+  client.set("key", `key${i}`, redis.print);
+}
+

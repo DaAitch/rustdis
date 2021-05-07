@@ -2,16 +2,7 @@ use std::{error, fmt};
 
 use bytes::{Buf, BytesMut};
 
-const B_CR: u8 = b'\r';
-const B_LF: u8 = b'\n';
-const B_0: u8 = b'0';
-const B_1: u8 = b'1';
-const B_9: u8 = b'9';
-const B_PLUS: u8 = b'+';
-const B_MINUS: u8 = b'-';
-const B_COLLON: u8 = b':';
-const B_DOLLAR: u8 = b'$';
-const B_ASTERISK: u8 = b'*';
+use super::{B_0, B_1, B_9, B_ASTERISK, B_COLLON, B_CR, B_DOLLAR, B_LF, B_MINUS, B_PLUS};
 
 const NO_STATE: NoState = NoState {};
 
