@@ -4,6 +4,8 @@ use tokio::net::TcpStream;
 
 use super::{B_ASTERISK, B_DOLLAR};
 
+// currently unused, but kept here like a messy
+
 type Result<T> = std::io::Result<T>;
 
 pub struct SocketWriter<'a> {

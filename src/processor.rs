@@ -1,12 +1,16 @@
+use bytes::{BufMut, Bytes, BytesMut};
 use log::trace;
 use tokio::sync::mpsc;
 
 use crate::{
     connection::SendEvents,
     resp::read::{RespEventsVisitor, VisitorResult},
+    SharedState, SpreadState, STATE_SPREAD,
 };
 use std::{
-    fmt::{self, Debug},
+    collections::hash_map::DefaultHasher,
+    fmt::{self, Debug, Write},
+    hash::{Hash, Hasher},
     mem::replace,
 };
 
@@ -87,35 +91,24 @@ enum Events {
 
 pub struct Processor<'a> {
     sender: &'a mpsc::Sender<SendEvents>,
+    shared_state: &'a SharedState,
     state: ProcessorState,
 }
 
 impl<'a> Processor<'a> {
-    pub fn new(sender: &'a mpsc::Sender<SendEvents>, state: ProcessorState) -> Self {
-        Self { sender, state }
+    pub fn new(
+        sender: &'a mpsc::Sender<SendEvents>,
+        shared_state: &'a SharedState,
+        state: ProcessorState,
+    ) -> Self {
+        Self {
+            sender,
+            shared_state,
+            state,
+        }
     }
 
-    // DONT DELETE: is this how async closures may work? a closure return a future (async move)...
-    // fn run<
-    //     T: Future<Output = std::result::Result<(), SendError<SendEvents>>> + Send + 'static,
-    //     F: FnOnce(mpsc::Sender<SendEvents>) -> T,
-    // >(
-    //     &mut self,
-    //     f: F,
-    // ) {
-    //     let sender = self.sender.clone();
-
-    //     let _ = tokio::spawn(f(sender));
-    // }
-    // self.run(|sender| async move {
-    //     sender.send(event).await?;
-    //     Ok(())
-    // });
-
     fn send_cmd(&mut self, event: SendEvents) {
-        // let sender = self.sender.clone();
-        // spawn(async move { sender.send(event).await });
-
         self.sender.blocking_send(event).unwrap();
     }
 
@@ -140,7 +133,7 @@ impl<'a> Processor<'a> {
                 match (drain.next(), drain.next(), drain.next(), drain.next()) {
                     (Some(ProcessorState::BulkString(Some(cmd))), None, None, None) => {
                         if cmd.eq_ignore_ascii_case(b"info") {
-                            self.send_cmd(SendEvents::InfoCommand);
+                            self.send_cmd(SendEvents::Data(Bytes::from_static(b"$2\r\nOK\r\n")))
                         }
                     }
                     (
@@ -150,7 +143,23 @@ impl<'a> Processor<'a> {
                         None,
                     ) => {
                         if cmd.eq_ignore_ascii_case(b"get") {
-                            self.send_cmd(SendEvents::GetCommand(p1_str));
+                            let state = get_spread_state(self.shared_state, &p1_str);
+                            match state.read().unwrap().get(&p1_str) {
+                                Some(value) => {
+                                    let mut buf = BytesMut::with_capacity(value.len() + 26); // 21 max size u64 in dec, + 5 ("$\r\n\r\n")
+                                    buf.put_u8(b'$');
+                                    write!(buf, "{}", value.len()).unwrap();
+                                    buf.put_u8(b'\r');
+                                    buf.put_u8(b'\n');
+                                    buf.extend(value);
+                                    buf.put_u8(b'\r');
+                                    buf.put_u8(b'\n');
+                                    self.send_cmd(SendEvents::Data(buf.freeze()));
+                                }
+                                None => {
+                                    self.send_cmd(SendEvents::Data(Bytes::from_static(b"$-1\r\n")))
+                                }
+                            }
                         }
                     }
                     (
@@ -160,7 +169,9 @@ impl<'a> Processor<'a> {
                         None,
                     ) => {
                         if cmd.eq_ignore_ascii_case(b"set") {
-                            self.send_cmd(SendEvents::SetCommand(p1_str, p2_str));
+                            let state = get_spread_state(self.shared_state, &p1_str);
+                            self.send_cmd(SendEvents::Data(Bytes::from_static(b"$2\r\nOK\r\n")));
+                            state.write().unwrap().insert(p1_str, p2_str);
                         }
                     }
 
@@ -264,4 +275,10 @@ fn last_unexhausted_array<'a>(
         ProcessorState::Array(Some(ArrayData { remaining, .. })) if *remaining >= 1 => Some(last),
         _ => None,
     }
+}
+
+fn get_spread_state<'a>(shared_state: &'a SharedState, key: &Vec<u8>) -> &'a SpreadState {
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    &shared_state[hasher.finish() as usize % STATE_SPREAD]
 }

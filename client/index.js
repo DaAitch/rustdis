@@ -6,8 +6,11 @@ client.on("error", function(error) {
 });
 
 let start = Date.now();
-for (let i = 0; i < 100000; i++) {
+for (let i = 0; i < 100; i++) {
   client.set(`key${i}`, `value${i}`);
+  client.get(`key${i}`, (err, reply) => {
+    console.log(reply)
+  })
 }
 
 client.set(`key`, `value`, () => {

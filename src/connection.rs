@@ -1,19 +1,16 @@
-use crate::{
-    processor::{Processor, ProcessorError, ProcessorState},
-    resp::write::SocketWriter,
-};
+use crate::processor::{Processor, ProcessorError, ProcessorState};
 use crate::{
     resp::read::{RespError, RespEventsTransformer},
     SharedState,
 };
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use log::{debug, trace};
-use tokio::net::TcpStream;
 use tokio::{
     io::AsyncReadExt,
     spawn,
     sync::mpsc::{Receiver, Sender},
 };
+use tokio::{io::AsyncWriteExt, net::TcpStream};
 use tokio::{sync::mpsc, task::spawn_blocking};
 
 #[derive(Debug)]
@@ -34,12 +31,9 @@ pub async fn handle_connection(socket: TcpStream, shared_state: SharedState) -> 
         buf: BytesMut::with_capacity(65536), // which number makes sense?
         state: ProcessorState::NoState,
         sender,
-    };
-    let mut io_ctx = UpstreamContext {
-        socket,
-        receiver,
         shared_state,
     };
+    let mut io_ctx = UpstreamContext { socket, receiver };
 
     while io_ctx
         .socket
@@ -56,8 +50,9 @@ pub async fn handle_connection(socket: TcpStream, shared_state: SharedState) -> 
                 mut buf,
                 state,
                 sender,
+                shared_state,
             } = process_ctx;
-            let mut processor = Processor::new(&sender, state);
+            let mut processor = Processor::new(&sender, &shared_state, state);
             transformer
                 .process(&mut processor, &mut buf)
                 .map_err(|err| ConnectionError::Resp(err))?;
@@ -72,54 +67,25 @@ pub async fn handle_connection(socket: TcpStream, shared_state: SharedState) -> 
                     buf,
                     state,
                     sender,
+                    shared_state,
                 })
             }))
         });
 
         let upstream_task = spawn(async move {
-            let mut socket_writer = SocketWriter::new(&mut io_ctx.socket);
-
             while let Some(event) = io_ctx.receiver.recv().await {
                 trace!("upstream event: {}", &event);
 
                 match event {
-                    SendEvents::InfoCommand => {
-                        socket_writer
-                            .write_ok()
+                    SendEvents::Data(bytes) => {
+                        io_ctx
+                            .socket
+                            .write_all(&bytes)
                             .await
                             .map_err(ConnectionError::Io)?;
-                    }
-                    SendEvents::SetCommand(key, value) => {
-                        let _ = io_ctx.shared_state.write().unwrap().insert(key, value);
-                        socket_writer
-                            .write_ok()
-                            .await
-                            .map_err(ConnectionError::Io)?;
-                    }
-                    SendEvents::GetCommand(key) => {
-                        let state = io_ctx
-                            .shared_state
-                            .read()
-                            .unwrap()
-                            .get(&key)
-                            .map(|value| value.clone());
-
-                        match state {
-                            Some(value) => {
-                                socket_writer
-                                    .write_bulk_string(value.as_slice())
-                                    .await
-                                    .map_err(ConnectionError::Io)?;
-                            }
-                            None => {
-                                socket_writer
-                                    .write_bulk_string_nil()
-                                    .await
-                                    .map_err(ConnectionError::Io)?;
-                            }
-                        }
                     }
                     SendEvents::End => {
+                        io_ctx.socket.flush().await.map_err(ConnectionError::Io)?;
                         break;
                     }
                 }
@@ -152,28 +118,15 @@ pub async fn handle_connection(socket: TcpStream, shared_state: SharedState) -> 
 
 #[derive(Debug)]
 pub enum SendEvents {
-    SetCommand(Vec<u8>, Vec<u8>),
-    GetCommand(Vec<u8>),
-    InfoCommand,
+    Data(Bytes),
     End,
 }
 
 impl std::fmt::Display for SendEvents {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SendEvents::InfoCommand => {
-                write!(f, "info")
-            }
-            SendEvents::SetCommand(key, value) => {
-                let key = String::from_utf8(key.clone()).map_err(|_| std::fmt::Error {})?;
-                let value = String::from_utf8(value.clone()).map_err(|_| std::fmt::Error {})?;
-
-                write!(f, "set {} {}", &key, &value)
-            }
-            SendEvents::GetCommand(key) => {
-                let key = String::from_utf8(key.clone()).map_err(|_| std::fmt::Error {})?;
-
-                write!(f, "get {}", &key)
+            SendEvents::Data(bytes) => {
+                write!(f, "<< OUT {:?}", bytes)
             }
             SendEvents::End => {
                 write!(f, "END")
@@ -187,10 +140,10 @@ struct ProcessContext {
     buf: BytesMut,
     state: ProcessorState,
     sender: Sender<SendEvents>,
+    shared_state: SharedState,
 }
 
 struct UpstreamContext {
     socket: TcpStream,
     receiver: Receiver<SendEvents>,
-    shared_state: SharedState,
 }
