@@ -1,0 +1,17 @@
+{
+  "name": "rustdis-benchmark",
+  "version": "0.0.1",
+  "description": "Benchmarking rustdis",
+  "main": "index.js",
+  "scripts": {
+    "bench": "node bench.js"
+  },
+  "keywords": ["benchmark"],
+  "author": "Philipp Renoth <renoth@aitch.de>",
+  "license": "ISC",
+  "devDependencies": {
+    "chalk": "^4.1.1",
+    "execa": "^5.0.0",
+    "ora": "^5.4.0"
+  }
+}

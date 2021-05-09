@@ -1,14 +1,13 @@
 {
   "name": "rustdis-testclient",
-  "version": "1.0.0",
-  "description": "",
+  "version": "0.0.1",
+  "description": "A simple testclient for rustdis",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node index.js"
   },
   "keywords": [],
-  "author": "Philipp Renoth <renoth@wildoak.de>",
+  "author": "Philipp Renoth <renoth@aitch.de>",
   "license": "ISC",
   "dependencies": {
     "redis": "^3.0.2"

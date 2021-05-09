@@ -12,3 +12,13 @@ bytes = "1"
 futures = "0.3"
 log = "0.4"
 env_logger = "0.8"
+bencher = "0.1"
+
+# Should our implementation be at a point, where computation is the bottleneck, we can check these options again.
+# Those optimizations didn't improve anything yet.
+
+# [profile.release]
+# opt-level = 3
+# lto = true
+# codegen-units = 1
+# panic = "abort"

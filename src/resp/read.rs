@@ -1,4 +1,7 @@
-use super::{B_0, B_1, B_9, B_ASTERISK, B_COLLON, B_CR, B_DOLLAR, B_LF, B_MINUS, B_PLUS};
+use super::{
+    B_CR, B_LF, B_RESP_ARRAY_PREFIX, B_RESP_BULK_STRING_PREFIX, B_RESP_ERROR_PREFIX,
+    B_RESP_INTEGER_PREFIX, B_RESP_STRING_PREFIX,
+};
 use bytes::{Buf, BytesMut};
 use log::{debug, trace};
 use std::{error, fmt};
@@ -108,16 +111,16 @@ impl RespEventsTransformer {
 
         if buf.remaining() > 0 {
             match buf.get_u8() {
-                B_PLUS => self.buf_process_string(
+                B_RESP_STRING_PREFIX => self.buf_process_string(
                     StringState { string: vec![] },
                     visitor,
                     buf,
                     stack_frame,
                 ),
-                B_MINUS => {
+                B_RESP_ERROR_PREFIX => {
                     self.buf_process_error(ErrorState { error: vec![] }, visitor, buf, stack_frame)
                 }
-                B_COLLON => self.buf_process_integer(
+                B_RESP_INTEGER_PREFIX => self.buf_process_integer(
                     IntegerState {
                         integer: None,
                         is_negative: false,
@@ -126,13 +129,13 @@ impl RespEventsTransformer {
                     buf,
                     stack_frame,
                 ),
-                B_DOLLAR => self.buf_process_bulk_string_len(
+                B_RESP_BULK_STRING_PREFIX => self.buf_process_bulk_string_len(
                     BulkStringLenState { length: None },
                     visitor,
                     buf,
                     stack_frame,
                 ),
-                B_ASTERISK => self.buf_process_array_len(
+                B_RESP_ARRAY_PREFIX => self.buf_process_array_len(
                     ArrayLenState { length: None },
                     visitor,
                     buf,
@@ -285,13 +288,13 @@ impl RespEventsTransformer {
         while buf.remaining() > 0 {
             // TODO: check integer overflow e.g.: `:999...999`
             match (buf.get_u8(), st.integer.as_mut()) {
-                (str_digit @ B_0..=B_9, Some(integer)) => {
+                (str_digit @ b'0'..=b'9', Some(integer)) => {
                     *integer = (10 * *integer) + digit_to_usize_unchecked(str_digit);
                 }
-                (str_digit @ B_0..=B_9, None) => {
+                (str_digit @ b'0'..=b'9', None) => {
                     st.integer = Some(digit_to_usize_unchecked(str_digit));
                 }
-                (B_MINUS, None) => {
+                (b'-', None) => {
                     st.is_negative = true;
                 }
                 (B_CR, Some(integer)) => {
@@ -360,10 +363,10 @@ impl RespEventsTransformer {
         while buf.remaining() > 0 {
             let ch = buf.get_u8();
             match (ch, st.length.as_mut()) {
-                (str_digit @ B_0..=B_9, Some(length)) => {
+                (str_digit @ b'0'..=b'9', Some(length)) => {
                     *length = (10 * *length) + digit_to_usize_unchecked(str_digit);
                 }
-                (str_digit @ B_0..=B_9, None) => {
+                (str_digit @ b'0'..=b'9', None) => {
                     st.length = Some(digit_to_usize_unchecked(str_digit))
                 }
                 (B_CR, Some(length)) => {
@@ -377,7 +380,7 @@ impl RespEventsTransformer {
                         stack_frame,
                     );
                 }
-                (B_MINUS, None) => {
+                (B_RESP_ERROR_PREFIX, None) => {
                     visitor
                         .on_bulk_string(None)
                         .map_err(RespError::VisitorError)?;
@@ -403,7 +406,7 @@ impl RespEventsTransformer {
     impl_step!(
         buf_process_bulk_string_len_nbs_one,
         NoState,
-        B_1,
+        b'1',
         State::BulkStringLenNbsOne,
         Self::buf_process_bulk_string_len_nbs_cr
     );
@@ -498,10 +501,10 @@ impl RespEventsTransformer {
         while buf.remaining() > 0 {
             let ch = buf.get_u8();
             match (ch, st.length.as_mut()) {
-                (str_digit @ B_0..=B_9, Some(length)) => {
+                (str_digit @ b'0'..=b'9', Some(length)) => {
                     *length = (10 * *length) + digit_to_usize_unchecked(str_digit);
                 }
-                (str_digit @ B_0..=B_9, None) => {
+                (str_digit @ b'0'..=b'9', None) => {
                     st.length = Some(digit_to_usize_unchecked(str_digit))
                 }
                 (B_CR, Some(length)) => {
@@ -511,7 +514,7 @@ impl RespEventsTransformer {
 
                     return self.buf_process_array_len_lf(NoState {}, visitor, buf, stack_frame);
                 }
-                (B_MINUS, None) => {
+                (B_RESP_ERROR_PREFIX, None) => {
                     visitor.on_array(None).map_err(RespError::VisitorError)?;
                     return self.buf_process_array_len_na_one(NO_STATE, visitor, buf, stack_frame);
                 }
@@ -530,7 +533,7 @@ impl RespEventsTransformer {
     impl_step!(
         buf_process_array_len_na_one,
         NoState,
-        B_1,
+        b'1',
         State::ArrayLenNaOne,
         Self::buf_process_array_len_na_cr
     );
@@ -561,7 +564,7 @@ impl RespEventsTransformer {
 }
 
 fn digit_to_usize_unchecked(ch: u8) -> usize {
-    (ch - B_0) as usize
+    (ch - b'0') as usize
 }
 
 /// "find" predicate for `buf.iter().enumerate().find(find_cr)`
@@ -728,7 +731,7 @@ mod tests {
     use std::fmt::Write;
 
     #[test]
-    fn test_simple_without_breaks() {
+    fn test_simple() {
         test_scenario(&[
             "",
             "+a string\r\n",
@@ -749,6 +752,7 @@ mod tests {
 
     fn test_scenario(values: &[&str], expected_outcome: &str) {
         {
+            // 1. test bytes as they come in the array
             let mut visitor = EventCollector::new();
             let mut resp = RespEventsTransformer::new();
 
@@ -760,6 +764,7 @@ mod tests {
         }
 
         {
+            // 2. send a bytes as single
             let mut visitor = EventCollector::new();
             let mut resp = RespEventsTransformer::new();
 

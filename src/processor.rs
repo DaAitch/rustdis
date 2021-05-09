@@ -25,7 +25,7 @@ impl fmt::Debug for ProcessorError {
 }
 
 #[derive(Debug)]
-struct ArrayData {
+pub struct ArrayData {
     remaining: usize,
     values: Vec<ProcessorState>,
 }
@@ -90,14 +90,14 @@ enum Events {
 }
 
 pub struct Processor<'a> {
-    sender: &'a mpsc::Sender<SendEvents>,
+    sender: &'a mpsc::UnboundedSender<SendEvents>,
     shared_state: &'a SharedState,
     state: ProcessorState,
 }
 
 impl<'a> Processor<'a> {
     pub fn new(
-        sender: &'a mpsc::Sender<SendEvents>,
+        sender: &'a mpsc::UnboundedSender<SendEvents>,
         shared_state: &'a SharedState,
         state: ProcessorState,
     ) -> Self {
@@ -109,7 +109,7 @@ impl<'a> Processor<'a> {
     }
 
     fn send_cmd(&mut self, event: SendEvents) {
-        self.sender.blocking_send(event).unwrap();
+        self.sender.send(event).unwrap();
     }
 
     pub fn into_state(self) -> ProcessorState {
@@ -144,8 +144,9 @@ impl<'a> Processor<'a> {
                     ) => {
                         if cmd.eq_ignore_ascii_case(b"get") {
                             let state = get_spread_state(self.shared_state, &p1_str);
-                            match state.read().unwrap().get(&p1_str) {
+                            match state.lock().unwrap().get(&p1_str) {
                                 Some(value) => {
+                                    // self.send_cmd(SendEvents::Data(Bytes::from_static(b"$2\r\nOK\r\n")));
                                     let mut buf = BytesMut::with_capacity(value.len() + 26); // 21 max size u64 in dec, + 5 ("$\r\n\r\n")
                                     buf.put_u8(b'$');
                                     write!(buf, "{}", value.len()).unwrap();
@@ -171,10 +172,9 @@ impl<'a> Processor<'a> {
                         if cmd.eq_ignore_ascii_case(b"set") {
                             let state = get_spread_state(self.shared_state, &p1_str);
                             self.send_cmd(SendEvents::Data(Bytes::from_static(b"$2\r\nOK\r\n")));
-                            state.write().unwrap().insert(p1_str, p2_str);
+                            state.lock().unwrap().insert(p1_str, p2_str);
                         }
                     }
-
                     _ => {}
                 }
             }
