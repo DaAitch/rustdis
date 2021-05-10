@@ -17,7 +17,6 @@ pub enum ConnectionError {
     Resp(RespError<ProcessorError>),
     Io(std::io::Error),
     JoinError(tokio::task::JoinError),
-    SendError(tokio::sync::mpsc::error::SendError<SendEvents>),
 }
 
 type Result<T> = std::result::Result<T, ConnectionError>;
@@ -27,7 +26,7 @@ pub async fn handle_connection(socket: TcpStream, shared_state: SharedState) -> 
 
     let mut process_ctx = ProcessContext {
         transformer: RespEventsTransformer::new(),
-        buf: BytesMut::with_capacity(65536), // which number makes sense?
+        socket_read_buf: BytesMut::with_capacity(65536), // which number makes sense?
         state: ProcessorState::NoState,
         sender,
         shared_state,
@@ -35,23 +34,28 @@ pub async fn handle_connection(socket: TcpStream, shared_state: SharedState) -> 
     let mut io_ctx = UpstreamContext {
         socket,
         receiver,
-        other_buf: BytesMut::with_capacity(65536),
+        socket_read_backbuf: BytesMut::with_capacity(65536),
         write_buf: BytesMut::with_capacity(65536),
     };
 
     loop {
-        if !process_ctx.buf.has_remaining() {
-            let s = io_ctx
+        if !process_ctx.socket_read_buf.has_remaining() {
+            let read_len = io_ctx
                 .socket
-                .read_buf(&mut process_ctx.buf)
+                .read_buf(&mut process_ctx.socket_read_buf)
                 .await
                 .map_err(|err| ConnectionError::Io(err))?;
 
-            if s == 0 {
+            trace!("read {} bytes", read_len);
+
+            if read_len == 0 {
                 break;
             }
+
+            debug!(target: "payload", ">> IN  {:?}", &process_ctx.socket_read_buf);
+        } else {
+            trace!("buf not empty, so process it first");
         }
-        debug!(">> IN  {:?}", &process_ctx.buf);
 
         let upstream_task = spawn(async move {
             let end_of_socket = loop {
@@ -59,41 +63,22 @@ pub async fn handle_connection(socket: TcpStream, shared_state: SharedState) -> 
                     Some(event) = io_ctx.receiver.recv() => {
                         match event {
                             SendEvents::Data(bytes) => {
-                                let i = std::time::Instant::now();
-                                if io_ctx.write_buf.has_remaining() && io_ctx.write_buf.remaining_mut() < bytes.remaining() {
-                                    // check if bytes larger than capacity, then directly write?
-                                    io_ctx
-                                        .socket
-                                        .write_all(&io_ctx.write_buf)
-                                        .await
-                                        .map_err(ConnectionError::Io)?;
-
-                                    io_ctx.write_buf.clear();
-                                }
-
-                                io_ctx.write_buf.extend(bytes);
-
-                                trace!(target: "p", "write took {:?}", i.elapsed());
+                                trace!("data event {} bytes", bytes.remaining());
+                                write_or_buffer(&mut io_ctx.socket, &mut io_ctx.write_buf, &bytes).await?;
                             }
-                            SendEvents::End => {
-                                if io_ctx.write_buf.has_remaining() {
-                                    io_ctx
-                                        .socket
-                                        .write_all(&io_ctx.write_buf)
-                                        .await
-                                        .map_err(ConnectionError::Io)?;
-
-                                    io_ctx.write_buf.clear();
-                                }
-
-                                io_ctx.socket.flush().await.map_err(ConnectionError::Io)?;
+                            SendEvents::End(bytes) => {
+                                trace!("end event {} bytes", bytes.remaining());
+                                write_buffer(&mut io_ctx.socket, &mut io_ctx.write_buf, &bytes).await?;
                                 break false;
                             }
                         }
                     },
-                    read_buf_result = io_ctx.socket.read_buf(&mut io_ctx.other_buf) => {
-                        let s = read_buf_result.map_err(ConnectionError::Io)?;
-                        if s == 0 {
+                    read_buf_result = io_ctx.socket.read_buf(&mut io_ctx.socket_read_backbuf) => {
+                        let read_len = read_buf_result.map_err(ConnectionError::Io)?;
+
+                        trace!("2nd phase read event {} bytes", read_len);
+
+                        if read_len == 0 {
                             break true;
                         }
                     }
@@ -101,16 +86,17 @@ pub async fn handle_connection(socket: TcpStream, shared_state: SharedState) -> 
             };
 
             if end_of_socket {
+                trace!("draining events");
                 while let Some(event) = io_ctx.receiver.recv().await {
                     match event {
                         SendEvents::Data(bytes) => {
-                            io_ctx
-                                .socket
-                                .write_all(&bytes)
-                                .await
-                                .map_err(ConnectionError::Io)?;
+                            trace!("data event {} bytes", bytes.remaining());
+                            write_or_buffer(&mut io_ctx.socket, &mut io_ctx.write_buf, &bytes)
+                                .await?;
                         }
-                        SendEvents::End => {
+                        SendEvents::End(bytes) => {
+                            trace!("end event {} bytes", bytes.remaining());
+                            write_buffer(&mut io_ctx.socket, &mut io_ctx.write_buf, &bytes).await?;
                             io_ctx.socket.flush().await.map_err(ConnectionError::Io)?;
                             break;
                         }
@@ -122,30 +108,26 @@ pub async fn handle_connection(socket: TcpStream, shared_state: SharedState) -> 
         });
 
         process_ctx = block_in_place(move || {
-            debug!(target: "profiling", "start processing task");
             let ProcessContext {
                 mut transformer,
-                mut buf,
+                socket_read_buf: mut process_buf,
                 state,
                 sender,
                 shared_state,
             } = process_ctx;
 
             let mut processor = Processor::new(&sender, &shared_state, state);
-            // TODO: not send every few bytes a bulk at once !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
             transformer
-                .process(&mut processor, &mut buf)
+                .process(&mut processor, &mut process_buf)
                 .map_err(ConnectionError::Resp)?;
 
-            sender
-                .send(SendEvents::End)
-                .map_err(ConnectionError::SendError)?;
+            processor.flush_and_end();
 
             debug!(target: "profiling", "end processing task");
 
             Ok(ProcessContext {
                 transformer,
-                buf,
+                socket_read_buf: process_buf,
                 state: processor.into_state(),
                 sender,
                 shared_state,
@@ -161,8 +143,11 @@ pub async fn handle_connection(socket: TcpStream, shared_state: SharedState) -> 
         io_ctx = upstream_result.0;
 
         // process buf has been processed
-        process_ctx.buf.clear();
-        std::mem::swap(&mut process_ctx.buf, &mut io_ctx.other_buf);
+        process_ctx.socket_read_buf.clear();
+        std::mem::swap(
+            &mut process_ctx.socket_read_buf,
+            &mut io_ctx.socket_read_backbuf,
+        );
     }
 
     Ok(())
@@ -171,7 +156,7 @@ pub async fn handle_connection(socket: TcpStream, shared_state: SharedState) -> 
 #[derive(Debug)]
 pub enum SendEvents {
     Data(Bytes),
-    End,
+    End(Bytes),
 }
 
 impl std::fmt::Display for SendEvents {
@@ -180,8 +165,8 @@ impl std::fmt::Display for SendEvents {
             SendEvents::Data(bytes) => {
                 write!(f, "<< OUT {:?}", bytes)
             }
-            SendEvents::End => {
-                write!(f, "END")
+            SendEvents::End(bytes) => {
+                write!(f, "<< END {:?}", bytes)
             }
         }
     }
@@ -189,7 +174,7 @@ impl std::fmt::Display for SendEvents {
 
 struct ProcessContext {
     transformer: RespEventsTransformer,
-    buf: BytesMut,
+    socket_read_buf: BytesMut,
     state: ProcessorState,
     sender: UnboundedSender<SendEvents>,
     shared_state: SharedState,
@@ -198,6 +183,47 @@ struct ProcessContext {
 struct UpstreamContext {
     socket: TcpStream,
     receiver: UnboundedReceiver<SendEvents>,
-    other_buf: BytesMut,
+    socket_read_backbuf: BytesMut,
     write_buf: BytesMut,
+}
+
+async fn write_or_buffer(
+    socket: &mut TcpStream,
+    write_buf: &mut BytesMut,
+    bytes: &Bytes,
+) -> Result<()> {
+    if write_buf.has_remaining() && write_buf.remaining_mut() < bytes.remaining() {
+        // check if bytes larger than capacity, then directly write?
+
+        trace!("will write {} bytes", write_buf.remaining());
+        socket
+            .write_all(&write_buf)
+            .await
+            .map_err(ConnectionError::Io)?;
+
+        write_buf.clear();
+    }
+
+    write_buf.extend(bytes);
+    Ok(())
+}
+
+async fn write_buffer(
+    socket: &mut TcpStream,
+    write_buf: &mut BytesMut,
+    bytes: &Bytes,
+) -> Result<()> {
+    write_buf.extend(bytes);
+
+    trace!("will write {} bytes", write_buf.remaining());
+    socket
+        .write_all(&write_buf)
+        .await
+        .map_err(ConnectionError::Io)?;
+
+    write_buf.clear();
+
+    // and flush?
+    // io_ctx.socket.flush().await.map_err(ConnectionError::Io)?;
+    Ok(())
 }

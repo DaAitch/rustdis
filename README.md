@@ -33,7 +33,7 @@ Benchmark: `redis-benchmark -t set,get -n 1000000 -r 1000000 -c 1000`
 
 Current results (on my machine):
 
-- rustdis: ~70k/s (~77% redis performance)
+- rustdis: ~73k/s (~81% redis performance)
 - redis-server: ~90k/s
 
 ## Perf / Flamegraph
@@ -55,7 +55,7 @@ sysctl --system
 ### Run
 
 ```bash
-flamegraph ../target/release/rustdis
+flamegraph ./target/release/rustdis
 ```
 
 ## Performance Logs

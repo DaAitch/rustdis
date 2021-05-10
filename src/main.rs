@@ -10,11 +10,7 @@ mod connection;
 mod processor;
 mod resp;
 
-// again measured: seems to be no improvement
-const STATE_SPREAD: usize = 1;
-
-type SpreadState = Mutex<HashMap<Vec<u8>, Vec<u8>>>;
-type SharedState = Arc<[SpreadState; STATE_SPREAD]>;
+type SharedState = Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>;
 
 fn main() {
     env_logger::builder()
@@ -26,6 +22,7 @@ fn main() {
 
     let runtime = Builder::new_multi_thread()
         .enable_io()
+        .enable_time()
         .max_blocking_threads(8)
         .thread_name("rustdis-worker")
         .thread_stack_size(3 * 1024 * 1024)
@@ -38,7 +35,7 @@ fn main() {
 async fn run() {
     let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
 
-    let shared_state: SharedState = Arc::new([Default::default()]);
+    let shared_state: SharedState = Arc::new(Default::default());
 
     loop {
         let (socket, _) = listener.accept().await.unwrap();

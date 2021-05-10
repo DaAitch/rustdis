@@ -1,22 +1,18 @@
-use bytes::{BufMut, Bytes, BytesMut};
-use log::trace;
+use bytes::{BufMut, BytesMut};
+use log::{debug, trace};
 use tokio::sync::mpsc;
 
 use crate::{
     connection::SendEvents,
     resp::read::{RespEventsVisitor, VisitorResult},
-    SharedState, SpreadState, STATE_SPREAD,
+    SharedState,
 };
 use std::{
-    collections::hash_map::DefaultHasher,
     fmt::{self, Debug, Write},
-    hash::{Hash, Hasher},
     mem::replace,
 };
 
-pub enum ProcessorError {
-    UnknownCommand,
-}
+pub enum ProcessorError {}
 
 impl fmt::Debug for ProcessorError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -34,7 +30,7 @@ pub struct ArrayData {
 pub enum ProcessorState {
     NoState,
     String(Vec<u8>),
-    Integer(isize),
+    // Integer(isize),
     BulkString(Option<Vec<u8>>),
     Array(Option<ArrayData>),
 }
@@ -49,9 +45,9 @@ impl std::fmt::Display for ProcessorState {
                 let string = String::from_utf8(string.clone()).map_err(|_| std::fmt::Error {})?;
                 write!(f, "\"+{}\"", string)
             }
-            ProcessorState::Integer(integer) => {
-                write!(f, ":{}", integer)
-            }
+            // ProcessorState::Integer(integer) => {
+            //     write!(f, ":{}", integer)
+            // }
             ProcessorState::BulkString(maybe_string) => match maybe_string {
                 Some(string) => {
                     let string =
@@ -93,6 +89,7 @@ pub struct Processor<'a> {
     sender: &'a mpsc::UnboundedSender<SendEvents>,
     shared_state: &'a SharedState,
     state: ProcessorState,
+    buffer: BytesMut,
 }
 
 impl<'a> Processor<'a> {
@@ -105,11 +102,12 @@ impl<'a> Processor<'a> {
             sender,
             shared_state,
             state,
+            buffer: BytesMut::new(),
         }
     }
 
     fn send_cmd(&mut self, event: SendEvents) {
-        self.sender.send(event).unwrap();
+        self.sender.send(event).expect("receiver is never closed");
     }
 
     pub fn into_state(self) -> ProcessorState {
@@ -133,7 +131,7 @@ impl<'a> Processor<'a> {
                 match (drain.next(), drain.next(), drain.next(), drain.next()) {
                     (Some(ProcessorState::BulkString(Some(cmd))), None, None, None) => {
                         if cmd.eq_ignore_ascii_case(b"info") {
-                            self.send_cmd(SendEvents::Data(Bytes::from_static(b"$2\r\nOK\r\n")))
+                            self.write_buffer_fixed(b"$2\r\nOK\r\n")
                         }
                     }
                     (
@@ -143,22 +141,20 @@ impl<'a> Processor<'a> {
                         None,
                     ) => {
                         if cmd.eq_ignore_ascii_case(b"get") {
-                            let state = get_spread_state(self.shared_state, &p1_str);
-                            match state.lock().unwrap().get(&p1_str) {
+                            match self.shared_state.lock().unwrap().get(&p1_str) {
                                 Some(value) => {
-                                    // self.send_cmd(SendEvents::Data(Bytes::from_static(b"$2\r\nOK\r\n")));
-                                    let mut buf = BytesMut::with_capacity(value.len() + 26); // 21 max size u64 in dec, + 5 ("$\r\n\r\n")
-                                    buf.put_u8(b'$');
-                                    write!(buf, "{}", value.len()).unwrap();
-                                    buf.put_u8(b'\r');
-                                    buf.put_u8(b'\n');
-                                    buf.extend(value);
-                                    buf.put_u8(b'\r');
-                                    buf.put_u8(b'\n');
-                                    self.send_cmd(SendEvents::Data(buf.freeze()));
+                                    self.prepare_write_buffer(value.len() + 26); // 21 max size u64 in dec, + 5 ("$\r\n\r\n")
+
+                                    self.buffer.put_u8(b'$');
+                                    write!(self.buffer, "{}", value.len()).unwrap();
+                                    self.buffer.put_u8(b'\r');
+                                    self.buffer.put_u8(b'\n');
+                                    self.buffer.extend(value);
+                                    self.buffer.put_u8(b'\r');
+                                    self.buffer.put_u8(b'\n');
                                 }
                                 None => {
-                                    self.send_cmd(SendEvents::Data(Bytes::from_static(b"$-1\r\n")))
+                                    self.write_buffer_fixed(b"$-1\r\n");
                                 }
                             }
                         }
@@ -170,16 +166,40 @@ impl<'a> Processor<'a> {
                         None,
                     ) => {
                         if cmd.eq_ignore_ascii_case(b"set") {
-                            let state = get_spread_state(self.shared_state, &p1_str);
-                            self.send_cmd(SendEvents::Data(Bytes::from_static(b"$2\r\nOK\r\n")));
-                            state.lock().unwrap().insert(p1_str, p2_str);
+                            self.write_buffer_fixed(b"$2\r\nOK\r\n");
+                            self.shared_state.lock().unwrap().insert(p1_str, p2_str);
                         }
                     }
                     _ => {}
                 }
             }
-            _ => todo!(),
+            _ => unimplemented!(),
         }
+    }
+
+    fn write_buffer_fixed(&mut self, bytes: &[u8]) {
+        self.prepare_write_buffer(bytes.len());
+        self.buffer.extend(bytes);
+    }
+
+    fn prepare_write_buffer(&mut self, approx_size: usize) {
+        if self.buffer.remaining_mut() < approx_size {
+            if !self.buffer.is_empty() {
+                self.flush();
+            }
+
+            self.buffer.reserve(65536.max(approx_size));
+        }
+    }
+
+    fn flush(&mut self) {
+        let bytes = std::mem::replace(&mut self.buffer, BytesMut::new());
+        self.send_cmd(SendEvents::Data(bytes.freeze()));
+    }
+
+    pub fn flush_and_end(&mut self) {
+        let bytes = std::mem::replace(&mut self.buffer, BytesMut::new());
+        self.send_cmd(SendEvents::End(bytes.freeze()));
     }
 
     fn append_state(state: &mut ProcessorState, event: Events) -> bool {
@@ -197,7 +217,7 @@ impl<'a> Processor<'a> {
                     Some(len) => {
                         *state = ProcessorState::Array(Some(ArrayData {
                             remaining: len,
-                            values: vec![],
+                            values: Vec::with_capacity(len),
                         }));
                         false
                     }
@@ -224,7 +244,7 @@ impl<'a> Processor<'a> {
                                 })),
                                 None => ProcessorState::Array(None),
                             },
-                            _ => todo!(),
+                            _ => unimplemented!(),
                         };
 
                         values.push(elem);
@@ -261,7 +281,6 @@ impl<'a> RespEventsVisitor<ProcessorError> for Processor<'a> {
 
     fn on_array(&mut self, length: Option<usize>) -> VisitorResult<ProcessorError> {
         self.process_event(Events::Array(length));
-
         Ok(())
     }
 }
@@ -275,10 +294,4 @@ fn last_unexhausted_array<'a>(
         ProcessorState::Array(Some(ArrayData { remaining, .. })) if *remaining >= 1 => Some(last),
         _ => None,
     }
-}
-
-fn get_spread_state<'a>(shared_state: &'a SharedState, key: &Vec<u8>) -> &'a SpreadState {
-    let mut hasher = DefaultHasher::new();
-    key.hash(&mut hasher);
-    &shared_state[hasher.finish() as usize % STATE_SPREAD]
 }
